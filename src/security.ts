@@ -10,8 +10,68 @@ import { McpErrorFactory } from './errors.js';
 
 // Input validation limits
 const MAX_STRING_LENGTH = 10000;
+// A remote ability may explicitly permit a larger payload, but it may not
+// remove the connector's process-level memory guard. This accommodates encoded
+// plugin packages while keeping a hostile or malformed schema bounded.
+const MAX_SCHEMA_STRING_LENGTH = 100 * 1024 * 1024;
 const MAX_ARRAY_ELEMENTS = 1000;
 const MAX_OBJECT_DEPTH = 5;
+
+type InputSchema = Record<string, unknown>;
+
+function asSchema(value: unknown): InputSchema | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as InputSchema)
+    : undefined;
+}
+
+function propertySchema(schema: InputSchema | undefined, key: string): InputSchema | undefined {
+  const properties = asSchema(schema?.properties);
+  return asSchema(properties?.[key]);
+}
+
+function arrayItemSchema(schema: InputSchema | undefined, index: number): InputSchema | undefined {
+  if (Array.isArray(schema?.prefixItems)) {
+    const prefixSchema = asSchema(schema.prefixItems[index]);
+    if (prefixSchema) return prefixSchema;
+  }
+  return asSchema(schema?.items);
+}
+
+function stringLimit(schema: InputSchema | undefined): number {
+  const declared = schema?.maxLength;
+  if (typeof declared !== 'number' || !Number.isSafeInteger(declared) || declared < 0) {
+    return MAX_STRING_LENGTH;
+  }
+  return Math.min(declared, MAX_SCHEMA_STRING_LENGTH);
+}
+
+function schemaType(schema: InputSchema | undefined): string | undefined {
+  return typeof schema?.type === 'string' ? schema.type : undefined;
+}
+
+function shouldValidateSingularId(key: string, schema: InputSchema | undefined): boolean {
+  const type = schemaType(schema);
+  if (type !== undefined) return type === 'integer';
+  return key.endsWith('_id');
+}
+
+function shouldValidatePluralIds(key: string, schema: InputSchema | undefined): boolean {
+  const type = schemaType(schema);
+  if (type !== undefined) {
+    return type === 'array' && schemaType(asSchema(schema?.items)) === 'integer';
+  }
+  return key.endsWith('_ids');
+}
+
+function assertDepth(depth: number): void {
+  if (depth > MAX_OBJECT_DEPTH) {
+    throw McpErrorFactory.invalidParams(
+      `Input exceeds maximum nesting depth (${MAX_OBJECT_DEPTH})`,
+      { maxDepth: MAX_OBJECT_DEPTH }
+    );
+  }
+}
 
 // Upper bound on the string sanitizeError runs its regexes over. Error bodies
 // forwarded here are untrusted and can be up to MAX_ERROR_BODY_BYTES (64KB);
@@ -28,25 +88,27 @@ const MAX_SANITIZE_INPUT_LENGTH = 2000;
  * Recurses into nested objects and arrays to enforce string length and ID range checks.
  * Throws McpError with INVALID_PARAMS code on validation failure.
  */
-export function validateInput(args: Record<string, unknown>, depth = 0): void {
-  if (depth > MAX_OBJECT_DEPTH) {
-    throw McpErrorFactory.invalidParams(
-      `Input exceeds maximum nesting depth (${MAX_OBJECT_DEPTH})`,
-      { maxDepth: MAX_OBJECT_DEPTH }
-    );
-  }
+export function validateInput(
+  args: Record<string, unknown>,
+  schema?: InputSchema,
+  depth = 0
+): void {
+  assertDepth(depth);
 
   for (const [key, value] of Object.entries(args)) {
+    const valueSchema = propertySchema(schema, key);
+
     // String length check
-    if (typeof value === 'string' && value.length > MAX_STRING_LENGTH) {
+    const maxStringLength = stringLimit(valueSchema);
+    if (typeof value === 'string' && value.length > maxStringLength) {
       throw McpErrorFactory.invalidParams(
-        `Parameter "${key}" exceeds maximum length (${MAX_STRING_LENGTH} characters)`,
-        { parameter: key, maxLength: MAX_STRING_LENGTH }
+        `Parameter "${key}" exceeds maximum length (${maxStringLength} characters)`,
+        { parameter: key, maxLength: maxStringLength }
       );
     }
 
     // ID fields: accept number or numeric string, must be positive integer
-    if (key.endsWith('_id')) {
+    if (shouldValidateSingularId(key, valueSchema)) {
       if (typeof value !== 'string' && typeof value !== 'number') {
         throw McpErrorFactory.invalidParams(
           `Parameter "${key}" must be a string or number, got ${typeof value}`,
@@ -61,7 +123,7 @@ export function validateInput(args: Record<string, unknown>, depth = 0): void {
     }
 
     // Plural ID fields (e.g., site_ids): must be an array of valid positive integers
-    if (key.endsWith('_ids')) {
+    if (shouldValidatePluralIds(key, valueSchema)) {
       if (!Array.isArray(value)) {
         throw McpErrorFactory.invalidParams(`"${key}" must be an array`, { parameter: key });
       }
@@ -82,29 +144,43 @@ export function validateInput(args: Record<string, unknown>, depth = 0): void {
 
     // Array validation
     if (Array.isArray(value)) {
-      if (value.length > MAX_ARRAY_ELEMENTS) {
-        throw McpErrorFactory.invalidParams(
-          `Parameter "${key}" has too many elements (max ${MAX_ARRAY_ELEMENTS})`,
-          { parameter: key, maxElements: MAX_ARRAY_ELEMENTS, actualElements: value.length }
-        );
-      }
-      // Validate array elements (strings and nested objects)
-      for (const item of value) {
-        if (typeof item === 'string' && item.length > MAX_STRING_LENGTH) {
-          throw McpErrorFactory.invalidParams(
-            `Element in "${key}" exceeds maximum length (${MAX_STRING_LENGTH} characters)`,
-            { parameter: key, maxLength: MAX_STRING_LENGTH }
-          );
-        }
-        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
-          validateInput(item as Record<string, unknown>, depth + 1);
-        }
-      }
+      validateArray(key, value, valueSchema, depth);
     }
 
     // Nested object: recurse to validate contents (string lengths, ID ranges, depth)
     if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      validateInput(value as Record<string, unknown>, depth + 1);
+      validateInput(value as Record<string, unknown>, valueSchema, depth + 1);
+    }
+  }
+}
+
+function validateArray(
+  key: string,
+  value: unknown[],
+  schema: InputSchema | undefined,
+  depth: number
+): void {
+  assertDepth(depth);
+  if (value.length > MAX_ARRAY_ELEMENTS) {
+    throw McpErrorFactory.invalidParams(
+      `Parameter "${key}" has too many elements (max ${MAX_ARRAY_ELEMENTS})`,
+      { parameter: key, maxElements: MAX_ARRAY_ELEMENTS, actualElements: value.length }
+    );
+  }
+
+  for (const [index, item] of value.entries()) {
+    const itemSchema = arrayItemSchema(schema, index);
+    const maxItemLength = stringLimit(itemSchema);
+    if (typeof item === 'string' && item.length > maxItemLength) {
+      throw McpErrorFactory.invalidParams(
+        `Element in "${key}" exceeds maximum length (${maxItemLength} characters)`,
+        { parameter: key, maxLength: maxItemLength }
+      );
+    }
+    if (Array.isArray(item)) {
+      validateArray(key, item, itemSchema, depth + 1);
+    } else if (typeof item === 'object' && item !== null) {
+      validateInput(item as Record<string, unknown>, itemSchema, depth + 1);
     }
   }
 }

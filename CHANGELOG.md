@@ -3,6 +3,20 @@
 All notable changes to mainwp-mcp are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+Input validation now honors each ability parameter's declared JSON Schema
+`maxLength` instead of unconditionally rejecting every string over 10,000
+characters. Undeclared and malformed limits retain the conservative default,
+and declared limits remain bounded by a 100 MiB process-level ceiling.
+
+Identifier validation now also honors the declared schema type. Numeric
+`site_id` and `site_ids` fields retain positive-integer enforcement, while
+string identifiers such as `rollout_id` are no longer rejected solely because
+their parameter name ends in `_id`.
+
 ## [1.3.0] - 2026-08-07
 
 ### Added

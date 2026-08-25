@@ -32,6 +32,86 @@ describe('validateInput', () => {
     expect(() => validateInput({ field: maxString })).not.toThrow();
   });
 
+  it('should honor a larger schema maxLength for a string parameter', () => {
+    const schema = {
+      type: 'object',
+      properties: { plan_json: { type: 'string', maxLength: 1_048_576 } },
+    };
+    expect(() => validateInput({ plan_json: 'a'.repeat(22_246) }, schema)).not.toThrow();
+  });
+
+  it('should reject a string above its declared schema maxLength', () => {
+    const schema = {
+      type: 'object',
+      properties: { plan_json: { type: 'string', maxLength: 20_000 } },
+    };
+    expect(() => validateInput({ plan_json: 'a'.repeat(20_001) }, schema)).toThrow(
+      /maximum length \(20000 characters\)/
+    );
+  });
+
+  it('should honor schema maxLength values below the connector default', () => {
+    const schema = {
+      type: 'object',
+      properties: { label: { type: 'string', maxLength: 5 } },
+    };
+    expect(() => validateInput({ label: '123456' }, schema)).toThrow(
+      /maximum length \(5 characters\)/
+    );
+  });
+
+  it('should cap hostile schema maxLength values at the absolute limit', () => {
+    const schema = {
+      type: 'object',
+      properties: { payload: { type: 'string', maxLength: Number.MAX_SAFE_INTEGER } },
+    };
+    expect(() => validateInput({ payload: 'a'.repeat(100 * 1024 * 1024 + 1) }, schema)).toThrow(
+      /maximum length \(104857600 characters\)/
+    );
+  });
+
+  it('should apply nested object and array item string schemas', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        nested: {
+          type: 'object',
+          properties: { payload: { type: 'string', maxLength: 20_000 } },
+        },
+        payloads: {
+          type: 'array',
+          items: { type: 'string', maxLength: 20_000 },
+        },
+      },
+    };
+    const payload = 'a'.repeat(15_000);
+    expect(() => validateInput({ nested: { payload }, payloads: [payload] }, schema)).not.toThrow();
+  });
+
+  it('should apply string schemas through nested arrays', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        payloads: {
+          type: 'array',
+          items: {
+            type: 'array',
+            items: { type: 'string', maxLength: 20_000 },
+          },
+        },
+      },
+    };
+    expect(() => validateInput({ payloads: [['a'.repeat(15_000)]] }, schema)).not.toThrow();
+    expect(() => validateInput({ payloads: [['a'.repeat(20_001)]] }, schema)).toThrow(
+      /maximum length \(20000 characters\)/
+    );
+  });
+
+  it('should enforce the depth limit through nested arrays', () => {
+    const nestedArrays = [[[[[[['too deep']]]]]]];
+    expect(() => validateInput({ nested: nestedArrays })).toThrow(/maximum nesting depth/);
+  });
+
   it('should reject arrays exceeding MAX_ARRAY_ELEMENTS', () => {
     const largeArray = new Array(1001).fill('item');
     expect(() => validateInput({ items: largeArray })).toThrow(/too many elements/);
@@ -63,6 +143,35 @@ describe('validateInput', () => {
   it('should validate positive integer IDs for *_id fields', () => {
     expect(() => validateInput({ site_id: 123 })).not.toThrow();
     expect(() => validateInput({ site_id: '123' })).not.toThrow();
+  });
+
+  it('should honor a string schema for non-numeric *_id identifiers', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        rollout_id: { type: 'string', pattern: '^[A-Za-z0-9._-]+$' },
+      },
+    };
+    expect(() =>
+      validateInput({ rollout_id: 'mrnwebdesigns-canary-2026-08-23-r1' }, schema)
+    ).not.toThrow();
+  });
+
+  it('should keep numeric ID validation when the schema declares an integer', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        site_id: { type: 'integer', minimum: 1 },
+        site_ids: { type: 'array', items: { type: 'integer', minimum: 1 } },
+      },
+    };
+    expect(() => validateInput({ site_id: 85, site_ids: [85] }, schema)).not.toThrow();
+    expect(() => validateInput({ site_id: 'not-numeric' }, schema)).toThrow(
+      /must be a positive integer/
+    );
+    expect(() => validateInput({ site_ids: ['not-numeric'] }, schema)).toThrow(
+      /must be a positive integer/
+    );
   });
 
   it('should reject non-positive IDs', () => {
