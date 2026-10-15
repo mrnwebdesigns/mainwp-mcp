@@ -26,12 +26,12 @@ const JSON_SCHEMA_TYPES = new Set([
 /**
  * Ceiling on a string limit raised by a tool's declared maxLength. The schema
  * comes from the Dashboard, so a declaration can only raise the limit this
- * far. 64 MiB of characters is base64 for about 48 MiB of binary, which covers
- * a plugin ZIP upload (issue #74 declares 34952536) with room. POST bodies
- * have no outbound size cap to defer to; GET and DELETE requests still hit
+ * far. MRN Stack deployments support 50 MiB ZIPs, requiring exactly 69,905,068
+ * base64 characters including padding. Tighter tool-declared limits still
+ * apply. POST bodies have no outbound size cap to defer to; GET and DELETE requests still hit
  * MAX_URL_LENGTH in executeAbility, which rejects rather than truncates.
  */
-export const MAX_DECLARED_STRING_LENGTH = 64 * 1024 * 1024;
+export const MAX_DECLARED_STRING_LENGTH = Math.ceil((50 * 1024 * 1024) / 3) * 4;
 
 // Upper bound on the string sanitizeError runs its regexes over. Error bodies
 // forwarded here are untrusted and can be up to MAX_ERROR_BODY_BYTES (64KB);
