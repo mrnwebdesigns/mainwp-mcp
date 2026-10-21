@@ -286,7 +286,7 @@ function normalize(config: Config, name: string, args: Record<string, unknown>):
     site_url: url,
     items,
     major_overrides,
-    backup_receipt: r as Receipt,
+    backup_receipt: { site_id: r.site_id as number, nonce: r.nonce, receipt: r.receipt },
   };
 }
 function receiptValid(c: Config, r: Receipt): void {
@@ -478,6 +478,11 @@ export async function executeMaintenance(
   } catch {
     return {
       status: 'OUTCOME_UNKNOWN',
+      site_id: r.site_id,
+      site_url: r.site_url,
+      kind: r.kind,
+      items: r.items,
+      plan_sha256: plan.plan,
       request_id: pending.requestId,
       automatic_retry: false,
       message:
@@ -495,7 +500,16 @@ export async function executeMaintenance(
       plan_sha256: plan.plan,
     });
   } catch {
-    return { status: 'READBACK_REQUIRED', request_id: pending.requestId, automatic_retry: false };
+    return {
+      status: 'READBACK_REQUIRED',
+      site_id: r.site_id,
+      site_url: r.site_url,
+      kind: r.kind,
+      items: r.items,
+      plan_sha256: plan.plan,
+      request_id: pending.requestId,
+      automatic_retry: false,
+    };
   }
   const verified =
     object(readback) &&

@@ -440,6 +440,30 @@ describe('MRN maintenance through the public executor', () => {
     expect(result.filter(r => body(r).status === 'VERIFIED')).toHaveLength(1);
     expect(operations).toBe(1);
   });
+  it('canonicalizes receipt property order for the PHP provider digest', async () => {
+    await issued();
+    const preview = body(
+      await call({
+        ...base,
+        backup_receipt: {
+          receipt: receipt.receipt,
+          nonce: receipt.nonce,
+          site_id: receipt.site_id,
+        },
+      })
+    );
+    const result = body(
+      await call({
+        ...base,
+        confirm: true,
+        user_confirmed: true,
+        confirmation_token: preview.confirmation_token,
+      })
+    );
+    expect(result.status).toBe('VERIFIED');
+    const input = requests.find(r => r.name.endsWith('/preflight-maintenance-v1'))!.input;
+    expect(Object.keys(input.backup_receipt as object)).toEqual(['site_id', 'nonce', 'receipt']);
+  });
   it('does not retry a lost write response', async () => {
     await issued();
     executeMode = 'lost';
