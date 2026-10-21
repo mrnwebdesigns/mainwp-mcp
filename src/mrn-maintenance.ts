@@ -491,6 +491,8 @@ export async function executeMaintenance(
       site_url: r.site_url,
       kind: r.kind,
       slugs: r.items.map(i => i.slug),
+      request_id: pending.requestId,
+      plan_sha256: plan.plan,
     });
   } catch {
     return { status: 'READBACK_REQUIRED', request_id: pending.requestId, automatic_retry: false };
@@ -501,6 +503,8 @@ export async function executeMaintenance(
     readback.site_id === r.site_id &&
     readback.site_url === r.site_url &&
     readback.kind === r.kind &&
+    readback.request_id === pending.requestId &&
+    readback.plan_sha256 === plan.plan &&
     equal(
       readback.items,
       r.items.map(i => ({ slug: i.slug, version: i.to }))

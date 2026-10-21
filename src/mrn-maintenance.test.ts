@@ -115,7 +115,11 @@ beforeEach(() => {
       const name = decodeURIComponent(url.pathname.split('/abilities/')[1].slice(0, -4));
       const input = options.body
         ? JSON.parse(String(options.body)).input
-        : Object.fromEntries(url.searchParams);
+        : url.searchParams.has('input_json')
+          ? JSON.parse(url.searchParams.get('input_json')!)
+          : Object.fromEntries(
+              [...url.searchParams].map(([k, v]) => [k.replace(/^input\[([^\]]+)\]$/, '$1'), v])
+            );
       requests.push({ name, input });
       if (name.endsWith('/get-database-backup-status-v1'))
         return new Response(
@@ -168,6 +172,8 @@ beforeEach(() => {
               site_id: 7,
               site_url: base.site_url,
               kind: 'plugin',
+              request_id: input.request_id,
+              plan_sha256: input.plan_sha256,
               items: base.items.map(i => ({ slug: i.slug, version: i.to })),
               unrelated_unchanged: true,
               core_unchanged: true,
@@ -459,6 +465,11 @@ describe('MRN maintenance through the public executor', () => {
       logger
     );
     expect(JSON.parse(r.contents[0].text).implementation).toBe('local-mrn-maintenance-gate');
+  });
+  it.each(['request_id', 'plan_sha256'])('refuses readback from another %s', async key => {
+    await issued();
+    readPatch = v => ({ ...v, [key]: 'different-operation' });
+    expect(body(await confirmed()).status).toBe('PARTIAL_OR_UNVERIFIED');
   });
   it('discovers and refuses unsafe execution over the actual MCP handlers', async () => {
     catalog = catalog.filter(a => !a.name.includes('maintenance'));

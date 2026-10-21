@@ -132,8 +132,10 @@ Three dedicated, reviewed abilities must advertise
    retries must reconcile, never repeat a write. Return the contract, site ID,
    exact URL, request ID, plan hash and `status:"complete"` only on full success.
 3. `mrn-mainwp/read-maintenance-state-v1`: read-only GET, non-destructive.
-   Independently read fresh authenticated Child state for exact site/kind/slugs;
-   return `contract`, `site_id`, `site_url`, `kind`, sorted `items` as
+   Independently read fresh authenticated Child state for exact site/kind/slugs,
+   `request_id` and `plan_sha256`; require the matching retained before-state.
+   Return `contract`, `site_id`, `site_url`, `kind`, the same `request_id` and
+   `plan_sha256`, sorted `items` as
    `{slug,version}`, `unrelated_unchanged:true`, and `core_unchanged:true` only
    when independently verified against the retained before-state. Failure to
    prove these invariants is a partial/unverified result.
