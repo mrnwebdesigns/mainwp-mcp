@@ -3,6 +3,21 @@
 All notable changes to mainwp-mcp are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] - MRN integration
+
+### Added
+
+Guarded MRN plugin/theme maintenance with exact-version previews, verified
+remote backup receipts, single-use confirmation and independently bound installed
+readback. Core and stock update execution remain unavailable in this path.
+
+### Changed
+
+Integrate official 1.5.1 while retaining MRN's 50 MiB ZIP contract: schema-declared
+strings allow up to 69,905,068 base64 characters. The older MRN 100 MiB ceiling
+is superseded. Upstream schema-aware identifier and recursive validation retain
+the prior MRN compatibility behavior.
+
 ## [1.5.1] - 2026-10-13
 
 ### Changed
