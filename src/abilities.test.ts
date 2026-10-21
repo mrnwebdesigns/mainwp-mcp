@@ -6,6 +6,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   fetchAbilities,
   fetchCategories,
+  getAbilityCatalogMetadata,
+  getCachedAbilityCatalogMetadata,
   getAbility,
   getAbilityByToolName,
   executeAbility,
@@ -17,7 +19,7 @@ import {
 } from './abilities.js';
 import { createFetch, paginateApi, readLimitedBody } from './http-client.js';
 import { generateToolHelp, generateHelpDocument } from './help.js';
-import { McpError, MCP_ERROR_CODES } from './errors.js';
+import { McpError, MCP_ERROR_CODES, toMcpErrorResponse } from './errors.js';
 import {
   clearKnownSecrets,
   registerKnownSecrets,
@@ -192,6 +194,186 @@ const sampleAbilities: Ability[] = [
 const sampleCategories = [{ slug: 'mainwp-sites', label: 'Sites', description: 'Site management' }];
 
 const baseConfig = makeBaseConfig();
+
+describe('validated upstream 4xx execution boundary', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    clearCache();
+    clearKnownSecrets();
+    initRateLimiter(0);
+  });
+  afterEach(() => clearKnownSecrets());
+
+  async function failure(
+    body: unknown,
+    status = 400,
+    ability = sampleAbilities[0],
+    config = makeBaseConfig(),
+    input: Record<string, unknown> = {}
+  ) {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(body), { status, statusText: 'Rejected' })
+    );
+    let thrown: unknown;
+    try {
+      await executeAbility(config, ability.name, input, mockLogger, ability);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    return thrown as Error & { status: number; code: string };
+  }
+
+  it('throws numeric status and string code and serializes accepted 400 without substring classification', async () => {
+    const error = await failure({
+      code: 'mainwp_confirmation_required',
+      message: 'invalid confirmation',
+      data: { status: 400 },
+    });
+    expect(error).toMatchObject({ status: 400, code: 'mainwp_confirmation_required' });
+    expect(toMcpErrorResponse(error, sanitizeError).error).toEqual({
+      code: -32000,
+      message: 'Ability execution failed: mainwp_confirmation_required - invalid confirmation',
+      data: { upstream_code: 'mainwp_confirmation_required' },
+    });
+  });
+
+  it('sanitizes control and format characters across the entire message before truncation', async () => {
+    const error = await failure({
+      code: 'mainwp_confirmation_required',
+      message: `${'\u202e'.repeat(1000)}hello\u0000\u200f world ${'x'.repeat(10000)}`,
+    });
+    const response = toMcpErrorResponse(error, sanitizeError);
+    expect(response.error.code).toBe(-32000);
+    expect(response.error.message).toContain('hello world');
+    expect(response.error.message).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(response.error.message.length).toBeLessThanOrEqual(500);
+  });
+
+  it('accepts an own empty message without falling back to statusText', async () => {
+    const error = await failure({ code: 'mainwp_confirmation_required', message: '' });
+    expect(toMcpErrorResponse(error, sanitizeError).error).toEqual({
+      code: -32000,
+      message: 'Ability execution failed: mainwp_confirmation_required -',
+      data: { upstream_code: 'mainwp_confirmation_required' },
+    });
+  });
+
+  it.each(['credential', 'write-only'])(
+    'drops a reflected %s slug from the thrown HTTP code as well as metadata',
+    async kind => {
+      const secret = 'privatevalue';
+      if (kind === 'credential') registerKnownSecrets([secret]);
+      const ability: Ability = {
+        ...sampleAbilities[0],
+        input_schema: {
+          type: 'object',
+          properties: { value: { type: 'string', writeOnly: true } },
+        },
+      };
+      const error = await failure(
+        {
+          code: `reflected_${secret}`,
+          message: `Rejected ${secret}`,
+          data: { replacement: `mainwp/${secret}` },
+        },
+        400,
+        ability,
+        makeBaseConfig(),
+        kind === 'write-only' ? { value: secret } : {}
+      );
+      expect(error.code).toBe('400');
+      expect(error.message).not.toContain(secret);
+      expect(toMcpErrorResponse(error, sanitizeError).error).toMatchObject({ code: -32000 });
+      expect(toMcpErrorResponse(error, sanitizeError).error.data).toBeUndefined();
+    }
+  );
+
+  it('preserves credential diagnostics on an accepted 401', async () => {
+    const error = await failure({ code: 'invalid_username', message: 'Unknown login' }, 401);
+    expect(error.message).toContain('MAINWP_USER from the environment');
+    expect(toMcpErrorResponse(error, sanitizeError).error).toMatchObject({
+      code: -32010,
+      data: { upstream_code: 'invalid_username' },
+    });
+  });
+
+  it.each([false, true])(
+    'preserves JSON-carrier diagnostics on an accepted 400 (writeOnly=%s)',
+    async writeOnly => {
+      const ability: Ability = {
+        ...sampleAbilities[0],
+        input_schema: {
+          type: 'object',
+          required: ['cursor'],
+          properties: { cursor: { type: ['string', 'null'], writeOnly } },
+        },
+      };
+      const error = await failure(
+        { code: 'ability_invalid_input', message: 'Invalid input' },
+        400,
+        ability,
+        makeBaseConfig(),
+        { cursor: 'privatecursor' }
+      );
+      expect(error.message).toContain('older than MainWP Dashboard 6.2');
+      expect(toMcpErrorResponse(error, sanitizeError).error).toMatchObject({
+        code: -32000,
+        data: { upstream_code: 'ability_invalid_input' },
+      });
+      if (writeOnly) expect(error.message).toContain('upstream message is withheld');
+    }
+  );
+
+  it('retries an accepted readonly 429 and succeeds', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 'mainwp_rate_limited', message: 'Slow down' }), {
+        status: 429,
+      })
+    );
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ success: true })));
+    await expect(
+      executeAbility(
+        makeBaseConfig({ retryEnabled: true, retryBaseDelay: 1, retryMaxDelay: 1 }),
+        sampleAbilities[0].name,
+        {},
+        mockLogger,
+        sampleAbilities[0]
+      )
+    ).resolves.toEqual({ success: true });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry an accepted readonly 400', async () => {
+    const error = await failure(
+      { code: 'mainwp_confirmation_required', message: 'Needs confirmation' },
+      400,
+      sampleAbilities[0],
+      makeBaseConfig({ retryEnabled: true, retryBaseDelay: 1, retryMaxDelay: 1 })
+    );
+    expect(error.status).toBe(400);
+    expect(toMcpErrorResponse(error, sanitizeError).error.code).toBe(-32000);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry an accepted write 429', async () => {
+    const ability = {
+      ...sampleAbilities[0],
+      meta: { annotations: { readonly: false, destructive: false, idempotent: true } },
+    };
+    const error = await failure(
+      { code: 'mainwp_rate_limited', message: 'Slow down' },
+      429,
+      ability,
+      makeBaseConfig({ retryEnabled: true, retryBaseDelay: 1, retryMaxDelay: 1 })
+    );
+    expect(toMcpErrorResponse(error, sanitizeError).error).toMatchObject({
+      code: -32029,
+      data: { upstream_code: 'mainwp_rate_limited' },
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('fetchAbilities', () => {
   beforeEach(() => {
@@ -1231,6 +1413,311 @@ describe('getAbilityByToolName', () => {
   });
 });
 
+describe('required nullable JSON carrier', () => {
+  const schema = {
+    type: 'object',
+    required: ['cursor'],
+    properties: {
+      cursor: { type: ['string', 'null'] },
+      optional: { type: ['string', 'null'] },
+      flag: { type: 'boolean' },
+      count: { type: ['integer', 'null'] },
+      amount: { type: 'number' },
+      text: { type: ['integer', 'string'] },
+      nested: { type: 'object', properties: { flag: { type: 'boolean' } } },
+    },
+  };
+  const carrierAbility: Ability = {
+    ...sampleAbilities[0],
+    name: 'mainwp/list-records-v1',
+    input_schema: schema,
+  };
+  const deleteAbility: Ability = {
+    ...sampleAbilities[1],
+    name: 'mainwp/reset-record-v1',
+    input_schema: {
+      type: 'object',
+      required: ['preview_token'],
+      properties: {
+        preview_token: { type: ['string', 'null'] },
+        dry_run: { type: 'boolean' },
+        confirm: { type: 'boolean' },
+      },
+    },
+  };
+  const versionNote =
+    "If this Dashboard is older than MainWP Dashboard 6.2, update it: this ability's input cannot be delivered to earlier versions.";
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    clearCache();
+    clearKnownSecrets();
+    initRateLimiter(0);
+  });
+
+  function run(input?: Record<string, unknown>, ability = carrierAbility) {
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ success: true })));
+    return executeAbility(baseConfig, ability.name, input, undefined, ability);
+  }
+
+  function request() {
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    return mockFetch.mock.calls[0] as [string, RequestInit];
+  }
+
+  it.each([
+    { cursor: null, optional: null, count: 5, omitted: undefined },
+    { cursor: 'next', optional: 'present', count: 5 },
+  ])('GET keeps the exact input in input_json: %j', async input => {
+    await run(input);
+    const [url, options] = request();
+    expect(options.method).toBe('GET');
+    expect(url).toBe(
+      `${baseConfig.dashboardUrl}/wp-json/wp-abilities/v1/abilities/${carrierAbility.name}/run?input_json=${encodeURIComponent(JSON.stringify(input))}`
+    );
+    expect(JSON.parse(new URL(url).searchParams.get('input_json')!)).toEqual(
+      JSON.parse(JSON.stringify(input))
+    );
+    expect([...new URL(url).searchParams.keys()]).toEqual(['input_json']);
+    expect(options.body).toBeUndefined();
+  });
+
+  it.each([undefined, {}, { cursor: undefined }])(
+    'GET carries an empty JSON object for %j without the input= fallback',
+    async input => {
+      await run(input);
+      expect(new URL(request()[0]).search).toBe('?input_json=%7B%7D');
+    }
+  );
+
+  it('GET detects a property whose type is exactly null', async () => {
+    await run(
+      { cursor: null },
+      {
+        ...carrierAbility,
+        input_schema: { ...schema, properties: { cursor: { type: 'null' } } },
+      }
+    );
+    expect(new URL(request()[0]).search).toBe('?input_json=%7B%22cursor%22%3Anull%7D');
+  });
+
+  it('DELETE sends the exact JSON envelope and application/json without a query', async () => {
+    const input = { preview_token: null, dry_run: true, confirm: false };
+    await run(input, deleteAbility);
+    const [url, options] = request();
+    expect(options.method).toBe('DELETE');
+    expect(options.body).toBe('{"input":{"preview_token":null,"dry_run":true,"confirm":false}}');
+    expect(new URL(url).search).toBe('');
+    expect(new Headers(options.headers).get('content-type')).toBe('application/json');
+  });
+
+  it('GET preserves JSON booleans, nested values and string unions', async () => {
+    const input = {
+      cursor: null,
+      flag: false,
+      count: 5,
+      text: '5',
+      nested: { flag: 'false' },
+      extra: '5',
+    };
+    await run(input);
+    const json = new URL(request()[0]).searchParams.get('input_json');
+    expect(json).toBe(JSON.stringify(input));
+  });
+
+  it.each([
+    ['count', '5', 5],
+    ['count', '-5', -5],
+    ['count', '0', 0],
+    ['amount', '5', 5],
+    ['amount', '-5.25', -5.25],
+    ['amount', '0.25', 0.25],
+    ['flag', 'true', true],
+    ['flag', 'false', false],
+    ['flag', '1', true],
+    ['flag', '0', false],
+  ])('converts canonical %s string %s on the carrier', async (key, value, expected) => {
+    await run({ cursor: null, [key as string]: value });
+    expect(new URL(request()[0]).searchParams.get('input_json')).toBe(
+      JSON.stringify({ cursor: null, [key as string]: expected })
+    );
+  });
+
+  it.each([
+    ['count', '5.0'],
+    ['count', ' 5'],
+    ['count', '5\n'],
+    ['count', ''],
+    ['count', '05'],
+    ['count', '9007199254740992'],
+    ['amount', '1e3'],
+    ['amount', '+5'],
+    ['amount', '5.25\n'],
+    ['flag', 'yes'],
+    ['flag', ''],
+    ['flag', 'TRUE'],
+  ])('rejects non-canonical %s string %j locally', async (key, value) => {
+    const error = await run({ cursor: null, [key]: value }).catch(error => error);
+    expect(error).toBeInstanceOf(McpError);
+    if (!(error instanceof McpError)) throw new Error('Expected a local parameter rejection');
+    expect(error).toMatchObject({ code: MCP_ERROR_CODES.INVALID_PARAMS });
+    expect(error.message).toContain(`"${key}"`);
+    if (value) expect(error.message).not.toContain(value);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['GET', carrierAbility, { cursor: null, extra: 'é'.repeat(4096) }],
+    ['DELETE', deleteAbility, { preview_token: null, extra: 'é'.repeat(524288) }],
+  ])('rejects oversized %s JSON in UTF-8 locally', async (_method, ability, input) => {
+    await expect(run(input, ability)).rejects.toMatchObject({
+      code: MCP_ERROR_CODES.INVALID_PARAMS,
+      message: expect.stringContaining('"input"'),
+    });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'appends the version note to carrier input errors (writeOnly=%s)',
+    async writeOnly => {
+      const ability = writeOnly
+        ? {
+            ...carrierAbility,
+            input_schema: {
+              ...schema,
+              properties: { cursor: { type: ['string', 'null'], writeOnly: true } },
+            },
+          }
+        : carrierAbility;
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            code: 'ability_invalid_input',
+            message: 'cursor is a required property of input.',
+          }),
+          { status: 400 }
+        )
+      );
+      const error = await executeAbility(
+        baseConfig,
+        ability.name,
+        { cursor: 'next' },
+        undefined,
+        ability
+      ).catch(error => error);
+      expect(error).toMatchObject({ status: 400, code: 'ability_invalid_input' });
+      if (!(error instanceof Error)) throw new Error('Expected an upstream input rejection');
+      expect(error.message.endsWith(versionNote)).toBe(true);
+    }
+  );
+
+  it.each([
+    ['different status', 403, 'ability_invalid_input'],
+    ['different code', 400, 'mainwp_abilities_invalid_input_transport'],
+  ])('unchanged error behaviour: %s has no version note', async (_label, status, code) => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code, message: 'Rejected.' }), { status })
+    );
+    await expect(
+      executeAbility(baseConfig, carrierAbility.name, { cursor: null }, undefined, carrierAbility)
+    ).rejects.toMatchObject({ message: expect.not.stringContaining(versionNote) });
+  });
+
+  const malformedSchemas: Array<[string, unknown]> = [
+    ['required not an array', { ...schema, required: 'cursor' }],
+    ['non-string required entry', { ...schema, required: ['cursor', 7] }],
+    ['missing required property', { ...schema, required: ['cursor', 'missing'] }],
+    ['properties not an object', { ...schema, properties: [] }],
+    ['properties null', { ...schema, properties: null }],
+    [
+      'properties not plain',
+      {
+        ...schema,
+        properties: Object.assign(Object.create({ inherited: true }), schema.properties),
+      },
+    ],
+    ['property not an object', { ...schema, properties: { ...schema.properties, extra: true } }],
+    ['property is an array', { ...schema, properties: { cursor: [{ type: 'null' }] } }],
+    ['property null', { ...schema, properties: { cursor: null } }],
+    ['malformed type array', { ...schema, properties: { cursor: { type: ['null', 7] } } }],
+    ...['__proto__', 'constructor', 'prototype'].map((key): [string, unknown] => [
+      `reserved property ${key}`,
+      { ...schema, properties: { ...schema.properties, [key]: { type: 'null' } } },
+    ]),
+    ['reserved required key', { ...schema, required: ['cursor', '__proto__'] }],
+  ];
+
+  it.each([
+    [
+      'no required nullable',
+      {
+        ...carrierAbility,
+        input_schema: {
+          ...schema,
+          required: ['count'],
+          properties: { ...schema.properties, count: { type: 'integer' } },
+        },
+      },
+    ],
+    ['optional nullable', { ...carrierAbility, input_schema: { ...schema, required: [] } }],
+    ['other namespace', { ...carrierAbility, name: 'example/list-records-v1' }],
+    ['root default', { ...carrierAbility, input_schema: { ...schema, default: {} } }],
+    ['root union', { ...carrierAbility, input_schema: { ...schema, type: ['object', 'null'] } }],
+    ...malformedSchemas.map(([label, input_schema]) => [
+      label,
+      { ...carrierAbility, input_schema },
+    ]),
+  ] as Array<[string, Ability]>)(
+    'unchanged bracket form byte for byte: %s',
+    async (_label, ability) => {
+      await run({ cursor: null, text: 'a b', extra: ['x', 'y'], absent: undefined }, ability);
+      const [url, options] = request();
+      expect(new URL(url).search).toBe('?input[text]=a%20b&input[extra][]=x&input[extra][]=y');
+      expect(options.body).toBeUndefined();
+    }
+  );
+
+  it('unchanged POST envelope for a required nullable ability', async () => {
+    await run(
+      { preview_token: null },
+      {
+        ...deleteAbility,
+        meta: { annotations: { readonly: false, destructive: true, idempotent: false } },
+      }
+    );
+    const [url, options] = request();
+    expect(options.method).toBe('POST');
+    expect(options.body).toBe('{"input":{"preview_token":null}}');
+    expect(new URL(url).search).toBe('');
+  });
+
+  it.each(['mainwp/list_records', 'mainwp/List-records', 'mainwp/list.records'])(
+    'unchanged name validation rejects %s before transport',
+    async name => {
+      await expect(run({ cursor: null }, { ...carrierAbility, name })).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.INVALID_PARAMS,
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    }
+  );
+
+  it('unchanged bracket 400 has no version note', async () => {
+    const ability = { ...carrierAbility, input_schema: { ...schema, required: [] } };
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 'ability_invalid_input', message: 'Rejected.' }), {
+        status: 400,
+      })
+    );
+    await expect(
+      executeAbility(baseConfig, ability.name, { cursor: null }, undefined, ability)
+    ).rejects.toMatchObject({
+      status: 400,
+      code: 'ability_invalid_input',
+      message: 'Ability execution failed: ability_invalid_input - Rejected.',
+    });
+  });
+});
+
 describe('executeAbility', () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -1243,8 +1730,742 @@ describe('executeAbility', () => {
     vi.restoreAllMocks();
   });
 
+  async function callWithMockResponse(
+    abilityName: string,
+    input?: Record<string, unknown>,
+    extraAbility?: Ability
+  ) {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => (extraAbility ? [...sampleAbilities, extraAbility] : sampleAbilities),
+      headers: new Headers(),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ success: true }),
+      headers: new Headers(),
+    });
+    await executeAbility(baseConfig, abilityName, input);
+    return mockFetch.mock.calls[1] as [string, { method: string; body?: string }];
+  }
+
+  it.each([{}, undefined, { page: undefined }])(
+    'sends empty input= for a declared GET schema with %s',
+    async input => {
+      const [url, request] = await callWithMockResponse('mainwp/list-sites-v1', input);
+      expect(request.method).toBe('GET');
+      expect(url).toMatch(/\/run\?input=$/);
+    }
+  );
+
+  it('sends empty input= for a declared DELETE schema', async () => {
+    const [url, request] = await callWithMockResponse('mainwp/delete-site-v1', {});
+    expect(request.method).toBe('DELETE');
+    expect(url).toMatch(/\/run\?input=$/);
+  });
+
+  it('omits empty GET input so a top-level schema default applies', async () => {
+    const defaultAbility: Ability = {
+      ...sampleAbilities[0],
+      name: 'mainwp/default-read-v1',
+      input_schema: { type: ['object', 'null'], default: [] },
+    };
+    const [url, request] = await callWithMockResponse(
+      defaultAbility.name,
+      undefined,
+      defaultAbility
+    );
+    expect(request.method).toBe('GET');
+    expect(url).toMatch(/\/run$/);
+  });
+
+  it('omits empty DELETE input so a top-level schema default applies', async () => {
+    const defaultAbility: Ability = {
+      ...sampleAbilities[1],
+      name: 'mainwp/default-delete-v1',
+      input_schema: { type: ['object', 'null'], default: [] },
+    };
+    const [url, request] = await callWithMockResponse(
+      defaultAbility.name,
+      undefined,
+      defaultAbility
+    );
+    expect(request.method).toBe('DELETE');
+    expect(url).toMatch(/\/run$/);
+  });
+
+  it('omits unserializable GET input so a top-level schema default applies', async () => {
+    const defaultAbility: Ability = {
+      ...sampleAbilities[0],
+      name: 'mainwp/default-read-v1',
+      input_schema: { type: ['object', 'null'], default: [] },
+    };
+    const [url, request] = await callWithMockResponse(
+      defaultAbility.name,
+      { page: undefined },
+      defaultAbility
+    );
+    expect(request.method).toBe('GET');
+    expect(url).toMatch(/\/run$/);
+  });
+
+  it('omits empty GET input for an empty schema', async () => {
+    const emptySchemaAbility: Ability = {
+      ...sampleAbilities[0],
+      name: 'mainwp/empty-schema-read-v1',
+      input_schema: {},
+    };
+    const [url, request] = await callWithMockResponse(
+      emptySchemaAbility.name,
+      undefined,
+      emptySchemaAbility
+    );
+    expect(request.method).toBe('GET');
+    expect(url).toMatch(/\/run$/);
+  });
+
+  it('omits the query string for an empty GET without an input schema', async () => {
+    const noSchemaAbility = {
+      ...sampleAbilities[0],
+      name: 'mainwp/no-schema-read-v1',
+      input_schema: undefined,
+    };
+    const [url, request] = await callWithMockResponse(noSchemaAbility.name, {}, noSchemaAbility);
+    expect(request.method).toBe('GET');
+    expect(url).toMatch(/\/run$/);
+  });
+
+  it('still sends non-empty GET input without an input schema', async () => {
+    const noSchemaAbility = {
+      ...sampleAbilities[0],
+      name: 'mainwp/no-schema-read-v1',
+      input_schema: undefined,
+    };
+    const [url] = await callWithMockResponse(noSchemaAbility.name, { page: 2 }, noSchemaAbility);
+    expect(url).toMatch(/\/run\?input\[page\]=2$/);
+  });
+
+  it('sends an empty input object for a declared POST schema', async () => {
+    const [, request] = await callWithMockResponse('mainwp/update-site-v1', {});
+    expect(request.method).toBe('POST');
+    expect(JSON.parse(request.body ?? '')).toEqual({ input: {} });
+  });
+
+  it('omits empty POST input for an empty schema', async () => {
+    const emptySchemaAbility: Ability = {
+      ...sampleAbilities[6],
+      name: 'mainwp/empty-schema-post-v1',
+      input_schema: {},
+    };
+    const [, request] = await callWithMockResponse(
+      emptySchemaAbility.name,
+      undefined,
+      emptySchemaAbility
+    );
+    expect(request.method).toBe('POST');
+    expect(JSON.parse(request.body ?? '')).toEqual({});
+  });
+
+  it('omits input from a POST without an input schema', async () => {
+    const noSchemaAbility = {
+      ...sampleAbilities[6],
+      name: 'mainwp/no-schema-post-v1',
+      input_schema: undefined,
+    };
+    const [, request] = await callWithMockResponse(noSchemaAbility.name, {}, noSchemaAbility);
+    expect(request.method).toBe('POST');
+    expect(JSON.parse(request.body ?? '')).toEqual({});
+  });
+
+  it('still sends non-empty POST input without an input schema', async () => {
+    const noSchemaAbility = {
+      ...sampleAbilities[6],
+      name: 'mainwp/no-schema-post-v1',
+      input_schema: undefined,
+    };
+    const [, request] = await callWithMockResponse(
+      noSchemaAbility.name,
+      { site_id: 1 },
+      noSchemaAbility
+    );
+    expect(JSON.parse(request.body ?? '')).toEqual({ input: { site_id: 1 } });
+  });
+
+  it('keeps non-empty GET query encoding', async () => {
+    const [url] = await callWithMockResponse('mainwp/list-sites-v1', { page: 2 });
+    expect(url).toContain('input[page]=2');
+  });
+
   // HTTP Method Selection Tests
   // Rules: GET (readonly), DELETE (destructive + idempotent), POST (everything else)
+
+  it('preserves writeOnly discovery metadata and redacts nested private input from results', async () => {
+    const privateAbility: Ability = {
+      name: 'mainwp/private-profile-v1',
+      label: 'Private Profile',
+      description: 'Processes a private profile',
+      category: 'mainwp-private',
+      input_schema: {
+        type: 'object',
+        properties: {
+          profile: {
+            type: 'object',
+            writeOnly: true,
+            properties: {
+              token: { type: 'string' },
+              contacts: { type: 'array', items: { type: 'string' } },
+            },
+          },
+        },
+      },
+      meta: {
+        annotations: { readonly: false, destructive: false, idempotent: true },
+      },
+    };
+    const input = {
+      profile: {
+        token: 'private-token-123',
+        contacts: ['private@example.test', 'backup@example.test'],
+        updated_at: 0,
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [privateAbility],
+      headers: new Headers(),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ echoed: input.profile, status: 'validated', changed: false, count: 0 }),
+      headers: new Headers(),
+    });
+
+    const discovered = await fetchAbilities(baseConfig, false, mockLogger);
+    const result = await executeAbility(
+      baseConfig,
+      privateAbility.name,
+      input,
+      mockLogger,
+      discovered[0]
+    );
+    const serialized = JSON.stringify(result);
+
+    expect(
+      (discovered[0].input_schema?.properties as Record<string, Record<string, unknown>>).profile
+        .writeOnly
+    ).toBe(true);
+    expect(serialized).not.toContain('private-token-123');
+    expect(serialized).not.toContain('private@example.test');
+    expect(serialized).not.toContain('backup@example.test');
+    expect(serialized).toContain('[redacted]');
+    expect(result).toEqual({
+      echoed: '[redacted]',
+      status: 'validated',
+      changed: false,
+      // The private updated_at of 0 is too short to redact; an unrelated count
+      // of 0 must survive.
+      count: 0,
+    });
+    expect(
+      JSON.stringify(
+        Object.values(mockLogger).flatMap(
+          method => (method as { mock: { calls: unknown[] } }).mock.calls
+        )
+      )
+    ).not.toContain('private-token-123');
+  });
+
+  it('withholds a reflected nested writeOnly value from an upstream error', async () => {
+    const privateAbility: Ability = {
+      name: 'mainwp/private-error-v1',
+      label: 'Private Error',
+      description: 'Rejects a private value',
+      category: 'mainwp-private',
+      input_schema: {
+        type: 'object',
+        properties: {
+          credentials: {
+            type: 'object',
+            writeOnly: true,
+            properties: { api_token: { type: 'string' } },
+          },
+        },
+      },
+      meta: {
+        annotations: { readonly: false, destructive: false, idempotent: true },
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: async () =>
+        JSON.stringify({
+          code: 'invalid_private_value',
+          message: 'Rejected private-error-token',
+        }),
+      headers: new Headers(),
+    });
+
+    await expect(
+      executeAbility(
+        baseConfig,
+        privateAbility.name,
+        { credentials: { api_token: 'private-error-token' } },
+        mockLogger,
+        privateAbility
+      )
+    ).rejects.toThrow(
+      'Ability execution failed: invalid_private_value (HTTP 400). The upstream message is withheld because this call carried write-only input.'
+    );
+    expect(
+      JSON.stringify(
+        Object.values(mockLogger).flatMap(
+          method => (method as { mock: { calls: unknown[] } }).mock.calls
+        )
+      )
+    ).not.toContain('private-error-token');
+  });
+
+  it('withholds an upstream error for comma-coerced writeOnly items', async () => {
+    const privateAbility: Ability = {
+      ...sampleAbilities[0],
+      input_schema: {
+        type: 'object',
+        properties: {
+          tokens: { type: 'array', items: { type: 'string', writeOnly: true } },
+        },
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: async () =>
+        JSON.stringify({ code: 'rest_invalid_param', message: 'Invalid token TOKENAAAA1' }),
+      headers: new Headers(),
+    });
+
+    await expect(
+      executeAbility(
+        { ...baseConfig, retryEnabled: false },
+        privateAbility.name,
+        { tokens: 'TOKENAAAA1,TOKENBBBB2' },
+        mockLogger,
+        privateAbility
+      )
+    ).rejects.toMatchObject({
+      code: 'rest_invalid_param',
+      message:
+        'Ability execution failed: rest_invalid_param (HTTP 400). The upstream message is withheld because this call carried write-only input.',
+    });
+  });
+
+  it('redacts a writeOnly value spanning the error limit before retry logging', async () => {
+    const privateValue = 'SENTINEL_BOUNDARY_12345';
+    const privateAbility: Ability = {
+      ...sampleAbilities[0],
+      input_schema: {
+        type: 'object',
+        properties: { code: { type: 'string', writeOnly: true } },
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      statusText: 'Unavailable',
+      text: async () => 'x'.repeat(495) + privateValue,
+      headers: new Headers(),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      text: async () => '{"ok":true}',
+      headers: new Headers(),
+    });
+
+    const result = await executeAbility(
+      { ...baseConfig, retryEnabled: true, maxRetries: 2, retryBaseDelay: 0 },
+      privateAbility.name,
+      { code: privateValue },
+      mockLogger,
+      privateAbility
+    );
+    const logs = JSON.stringify(
+      Object.values(mockLogger).flatMap(
+        method => (method as { mock: { calls: unknown[] } }).mock.calls
+      )
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'Retrying request after transient error',
+      expect.any(Object)
+    );
+    expect(logs).not.toContain(privateValue);
+    expect(logs).not.toContain(privateValue.slice(0, 8));
+  });
+
+  it('does not expose a writeOnly value in a malformed successful response', async () => {
+    const privateValue = 'private-response-value';
+    const privateAbility: Ability = {
+      ...sampleAbilities[0],
+      input_schema: {
+        type: 'object',
+        properties: { code: { type: 'string', writeOnly: true } },
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      text: async () => `not-json ${privateValue}`,
+      headers: new Headers(),
+    });
+
+    await expect(
+      executeAbility(
+        { ...baseConfig, retryEnabled: false },
+        privateAbility.name,
+        { code: privateValue },
+        mockLogger,
+        privateAbility
+      )
+    ).rejects.toThrow('Invalid JSON in ability response');
+  });
+
+  it('reports the HTTP status for a numeric upstream error code while withholding the message', async () => {
+    const privateAbility: Ability = {
+      ...sampleAbilities[0],
+      input_schema: {
+        type: 'object',
+        properties: { code: { type: 'string', writeOnly: true } },
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: async () => JSON.stringify({ code: 42, message: 'bad private-code-value' }),
+      headers: new Headers(),
+    });
+
+    await expect(
+      executeAbility(
+        { ...baseConfig, retryEnabled: false },
+        privateAbility.name,
+        { code: 'private-code-value' },
+        mockLogger,
+        privateAbility
+      )
+    ).rejects.toThrow(
+      'Ability execution failed: 400 (HTTP 400). The upstream message is withheld because this call carried write-only input.'
+    );
+  });
+
+  it('still explains a credential rejection when the upstream message is withheld', async () => {
+    const privateAbility: Ability = {
+      ...sampleAbilities[0],
+      input_schema: {
+        type: 'object',
+        properties: { code: { type: 'string', writeOnly: true } },
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      text: async () =>
+        JSON.stringify({ code: 'invalid_username', message: 'Unknown login private-code-value' }),
+      headers: new Headers(),
+    });
+
+    const execution = executeAbility(
+      { ...baseConfig, retryEnabled: false },
+      privateAbility.name,
+      { code: 'private-code-value' },
+      mockLogger,
+      privateAbility
+    );
+    await expect(execution).rejects.toThrow(
+      'Ability execution failed: invalid_username (HTTP 401). The upstream message is withheld because this call carried write-only input. The Dashboard has no user'
+    );
+    await expect(execution).rejects.not.toThrow('private-code-value');
+  });
+
+  it('drops the username from the credential note when it matches a write-only value in any case', async () => {
+    const privateAbility: Ability = {
+      ...sampleAbilities[0],
+      input_schema: {
+        type: 'object',
+        properties: { code: { type: 'string', writeOnly: true } },
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      text: async () => JSON.stringify({ code: 'invalid_username', message: 'Site-Admin' }),
+      headers: new Headers(),
+    });
+
+    const error = await executeAbility(
+      { ...baseConfig, username: 'site-admin', retryEnabled: false },
+      privateAbility.name,
+      { code: 'Site-Admin' },
+      mockLogger,
+      privateAbility
+    ).catch((caught: Error) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      'Ability execution failed: invalid_username (HTTP 401). The upstream message is withheld because this call carried write-only input. The Dashboard rejected the credentials.'
+    );
+  });
+
+  it.each([
+    {
+      shape: 'a username the note escapes',
+      username: 'pa"ss_word1',
+      status: 401,
+      expected:
+        'Ability execution failed: invalid_username (HTTP 401). The upstream message is withheld because this call carried write-only input. The Dashboard rejected the credentials.',
+    },
+    {
+      shape: 'a username the note truncates',
+      username: `${'u'.repeat(95)}SecretTail42`,
+      status: 401,
+      expected:
+        'Ability execution failed: invalid_username (HTTP 401). The upstream message is withheld because this call carried write-only input. The Dashboard rejected the credentials.',
+    },
+    {
+      shape: 'a rejection code that is itself the write-only value',
+      username: 'site-admin',
+      secret: 'invalid_username',
+      status: 403,
+      expected:
+        'Ability execution failed: 403 (HTTP 403). The upstream message is withheld because this call carried write-only input. The Dashboard rejected the credentials.',
+    },
+  ])(
+    'keeps the credential note generic for $shape',
+    async ({ username, secret, status, expected }) => {
+      const privateAbility: Ability = {
+        ...sampleAbilities[0],
+        input_schema: {
+          type: 'object',
+          properties: { code: { type: 'string', writeOnly: true } },
+        },
+      };
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status,
+        statusText: 'Rejected',
+        text: async () => JSON.stringify({ code: 'invalid_username', message: 'Rejected' }),
+        headers: new Headers(),
+      });
+
+      const error = await executeAbility(
+        { ...baseConfig, username, retryEnabled: false },
+        privateAbility.name,
+        { code: secret ?? username },
+        mockLogger,
+        privateAbility
+      ).catch((caught: Error) => caught);
+
+      expect((error as Error).message).toBe(expected);
+    }
+  );
+
+  it.each([
+    {
+      shape: 'raw value',
+      input: { code: 'private-raw-value' },
+      body: { code: 'invalid_private', message: 'Rejected private-raw-value' },
+      expectedCode: 'invalid_private',
+      forbidden: 'private-raw-value',
+    },
+    {
+      shape: 'JSON-escaped value',
+      input: { code: 'a/b "c" d' },
+      body: { code: 'invalid_private', message: 'Rejected a\\/b \\"c\\" d' },
+      expectedCode: 'invalid_private',
+      forbidden: 'a\\/b',
+    },
+    {
+      shape: 'percent-encoded value',
+      input: { code: 'a b&c' },
+      body: { code: 'invalid_private', message: 'Rejected a%20b%26c' },
+      expectedCode: 'invalid_private',
+      forbidden: 'a%20b%26c',
+    },
+    {
+      shape: 'whole short-leaf object',
+      input: { code: { pin: 'xy', id: 12 } },
+      body: { code: 'invalid_private', message: 'Rejected {"pin":"xy","id":12}' },
+      expectedCode: 'invalid_private',
+      forbidden: '"pin":"xy"',
+    },
+    {
+      shape: 'value in the code field',
+      input: { code: 'private-code-value' },
+      body: { code: 'private-code-value', message: 'Rejected private-code-value' },
+      expectedCode: '400',
+      forbidden: 'private-code-value',
+    },
+    {
+      shape: 'writeOnly number embedded in an error code',
+      input: { code: 1234 },
+      body: { code: 'invalid1234', message: 'Rejected 1234' },
+      expectedCode: '400',
+      forbidden: '1234',
+    },
+    {
+      shape: 'case-folded writeOnly string embedded in an error code',
+      input: { code: 'ErrSecret1' },
+      body: { code: 'errsecret1', message: 'Rejected ErrSecret1' },
+      expectedCode: '400',
+      forbidden: 'ErrSecret1',
+    },
+    {
+      shape: 'unrelated error code with writeOnly input',
+      input: { code: 1234 },
+      body: { code: 'rest_invalid_param', message: 'Rejected 1234' },
+      expectedCode: 'rest_invalid_param',
+      forbidden: '1234',
+    },
+    {
+      shape: 'unsafe code characters',
+      input: { code: 'private-code-value' },
+      body: { code: 'invalid private/code', message: 'Rejected private-code-value' },
+      expectedCode: '400',
+      forbidden: 'private-code-value',
+    },
+    {
+      shape: 'code longer than 64 characters',
+      input: { code: 'private-code-value' },
+      body: { code: 'x'.repeat(65), message: 'Rejected private-code-value' },
+      expectedCode: '400',
+      forbidden: 'private-code-value',
+    },
+  ])(
+    'withholds upstream error text reflecting a $shape',
+    async ({ input, body, expectedCode, forbidden }) => {
+      const privateAbility: Ability = {
+        ...sampleAbilities[0],
+        input_schema: {
+          type: 'object',
+          properties: { code: { writeOnly: true } },
+        },
+      };
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        statusText: `Rejected ${forbidden}`,
+        text: async () => JSON.stringify(body),
+        headers: new Headers(),
+      });
+      const expectedMessage = `Ability execution failed: ${expectedCode} (HTTP 400). The upstream message is withheld because this call carried write-only input.`;
+      await expect(
+        executeAbility(
+          { ...baseConfig, retryEnabled: false },
+          privateAbility.name,
+          input,
+          mockLogger,
+          privateAbility
+        )
+      ).rejects.toMatchObject({ message: expectedMessage, code: expectedCode, status: 400 });
+      const logs = JSON.stringify(
+        Object.values(mockLogger).flatMap(
+          method => (method as { mock: { calls: unknown[] } }).mock.calls
+        )
+      );
+      expect(logs).not.toContain(forbidden);
+    }
+  );
+
+  it('relays a sanitized upstream message when no writeOnly value was supplied', async () => {
+    const ability: Ability = {
+      ...sampleAbilities[0],
+      input_schema: { type: 'object', properties: { code: { writeOnly: true } } },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: async () =>
+        JSON.stringify({ code: 'invalid_private', message: 'Rejected private-raw-value' }),
+      headers: new Headers(),
+    });
+
+    await expect(
+      executeAbility({ ...baseConfig, retryEnabled: false }, ability.name, {}, mockLogger, ability)
+    ).rejects.toThrow('Ability execution failed: invalid_private - Rejected private-raw-value');
+  });
+
+  it('keeps GET input out of a transport error that reflects the request URL', async () => {
+    mockFetch.mockImplementationOnce((url: string) =>
+      Promise.reject(new Error(`Failed to fetch ${url}`))
+    );
+
+    const error = (await executeAbility(
+      { ...baseConfig, retryEnabled: false },
+      sampleAbilities[0].name,
+      { page: 1234 },
+      mockLogger,
+      sampleAbilities[0]
+    ).catch(caught => caught)) as Error;
+
+    expect(error.message).toMatch(/^Failed to fetch https?:\/\/[^?]+$/);
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('input[page]=1234'),
+      expect.anything()
+    );
+  });
+
+  it('keeps GET input out of a response read error that reflects the request URL', async () => {
+    mockFetch.mockImplementationOnce((url: string) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: new ReadableStream({
+          start(controller) {
+            controller.error(new Error(`Failed to read ${url}`));
+          },
+        }),
+      })
+    );
+
+    const error = (await executeAbility(
+      { ...baseConfig, retryEnabled: false },
+      sampleAbilities[0].name,
+      { page: 1234 },
+      mockLogger,
+      sampleAbilities[0]
+    ).catch(caught => caught)) as Error;
+
+    expect(error.message).toMatch(/^Failed to read https?:\/\/[^?]+$/);
+  });
+
+  it('keeps the query string, and any GET input in it, out of a timeout error', async () => {
+    mockFetch.mockImplementationOnce((_url, options: RequestInit) => {
+      const signal = options.signal as AbortSignal;
+      const stream = new ReadableStream({
+        start(controller) {
+          signal.addEventListener(
+            'abort',
+            () => controller.error(new DOMException('aborted', 'AbortError')),
+            { once: true }
+          );
+        },
+      });
+      return Promise.resolve(new Response(stream));
+    });
+    const customFetch = createFetch(makeBaseConfig({ requestTimeout: 20 }));
+
+    const response = await customFetch('https://test.local/run?input[code]=private%20value');
+    const error = await readLimitedBody(response, 1000).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ code: 'ETIMEDOUT' });
+    expect((error as Error).message).toBe('Request timeout after 20ms: https://test.local/run');
+  });
 
   it('should use GET for readonly abilities', async () => {
     // First mock for fetchAbilities
@@ -1369,9 +2590,404 @@ describe('executeAbility', () => {
     const url = calls[1][0] as string;
     // DELETE uses query string, not JSON body
     expect(url).toContain('input[site_id]=1');
-    expect(url).toContain('input[dry_run]=true');
+    expect(url).toContain('input[dry_run]=1');
     // Should not have a body
     expect(calls[1][1].body).toBeUndefined();
+  });
+
+  it.each([
+    ...[
+      { label: 'boolean', positionSchema: { type: 'boolean' }, numeric: true },
+      { label: 'boolean/null', positionSchema: { type: ['boolean', 'null'] }, numeric: true },
+      { label: 'boolean/string', positionSchema: { type: ['boolean', 'string'] }, numeric: true },
+      { label: 'object/boolean', positionSchema: { type: ['object', 'boolean'] }, numeric: true },
+      { label: 'undeclared property', positionSchema: undefined, numeric: false },
+      { label: 'missing schema', positionSchema: undefined, numeric: false },
+      { label: 'missing type', positionSchema: {}, numeric: false },
+      { label: 'malformed type', positionSchema: { type: 42 }, numeric: false },
+      { label: 'empty type list', positionSchema: { type: [] }, numeric: false },
+      { label: 'malformed type list', positionSchema: { type: [null] }, numeric: false },
+      { label: 'integer', positionSchema: { type: 'integer' }, numeric: false },
+      { label: 'string', positionSchema: { type: 'string' }, numeric: false },
+      { label: 'Boolean', positionSchema: { type: 'Boolean' }, numeric: false },
+      { label: 'integer/string', positionSchema: { type: ['integer', 'string'] }, numeric: false },
+      {
+        label: 'integer/boolean',
+        positionSchema: { type: ['integer', 'boolean'] },
+        numeric: false,
+      },
+      { label: 'string/boolean', positionSchema: { type: ['string', 'boolean'] }, numeric: false },
+      { label: 'number/boolean', positionSchema: { type: ['number', 'boolean'] }, numeric: false },
+      { label: 'array/boolean', positionSchema: { type: ['array', 'boolean'] }, numeric: false },
+      {
+        label: 'boolean/non-string entry',
+        positionSchema: { type: ['boolean', 42] },
+        numeric: false,
+      },
+      {
+        label: 'integer/non-string entry',
+        positionSchema: { type: ['integer', 42] },
+        numeric: false,
+      },
+      {
+        label: 'integer/null entry/boolean',
+        positionSchema: { type: ['integer', null, 'boolean'] },
+        numeric: false,
+      },
+      {
+        label: 'anyOf integer/boolean',
+        positionSchema: { anyOf: [{ type: 'integer' }, { type: 'boolean' }] },
+        numeric: false,
+      },
+      {
+        label: 'oneOf boolean/integer',
+        positionSchema: { oneOf: [{ type: 'boolean' }, { type: 'integer' }] },
+        numeric: false,
+      },
+      {
+        label: 'allOf boolean',
+        positionSchema: { type: 'boolean', allOf: [{ type: 'boolean' }] },
+        numeric: false,
+      },
+    ].flatMap(row =>
+      ['scalar', 'array item', 'nested value'].flatMap(position =>
+        [true, false].map(value => {
+          const property =
+            position === 'array item'
+              ? { type: 'array', items: row.positionSchema }
+              : position === 'nested value'
+                ? { type: 'object', properties: { flag: row.positionSchema } }
+                : row.positionSchema;
+          const key =
+            position === 'array item'
+              ? 'flag][]'
+              : position === 'nested value'
+                ? 'flag][flag]'
+                : 'flag]';
+          const spelling = row.numeric ? (value ? '1' : '0') : String(value);
+          return {
+            label: `${row.label} at ${position} (${value})`,
+            input_schema:
+              row.label === 'missing schema'
+                ? undefined
+                : {
+                    type: 'object',
+                    properties: row.label === 'undeclared property' ? {} : { flag: property },
+                  },
+            input: {
+              flag:
+                position === 'array item'
+                  ? [value]
+                  : position === 'nested value'
+                    ? { flag: value }
+                    : value,
+            },
+            query: `?input[${key}=${spelling}`,
+          };
+        })
+      )
+    ),
+    {
+      label: 'additionalProperties integer',
+      input_schema: { type: 'object', additionalProperties: { type: 'integer' } },
+      input: { flag: true },
+      query: '?input[flag]=true',
+    },
+    {
+      label: 'additionalProperties boolean',
+      input_schema: { type: 'object', additionalProperties: { type: 'boolean' } },
+      input: { flag: false },
+      query: '?input[flag]=false',
+    },
+    {
+      label: 'declared property over additionalProperties',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: 'boolean' } },
+        additionalProperties: { type: 'integer' },
+      },
+      input: { flag: true },
+      query: '?input[flag]=1',
+    },
+    {
+      label: 'patternProperties',
+      input_schema: { type: 'object', patternProperties: { '^f': { type: 'boolean' } } },
+      input: { flag: true },
+      query: '?input[flag]=true',
+    },
+    {
+      label: 'anyOf on the input object',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: 'boolean' } },
+        anyOf: [{ properties: { flag: { type: 'integer' } } }],
+      },
+      input: { flag: false },
+      query: '?input[flag]=false',
+    },
+    {
+      label: 'array items from additionalProperties',
+      input_schema: {
+        type: 'object',
+        additionalProperties: { type: 'array', items: { type: 'integer' } },
+      },
+      input: { flag: [true] },
+      query: '?input[flag][]=true',
+    },
+    {
+      label: 'oneOf on an array',
+      input_schema: {
+        type: 'object',
+        properties: {
+          flag: { type: 'array', items: { type: 'boolean' }, oneOf: [{ maxItems: 1 }] },
+        },
+      },
+      input: { flag: [true] },
+      query: '?input[flag][]=true',
+    },
+    {
+      label: 'nested additionalProperties boolean',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: 'object', additionalProperties: { type: 'boolean' } } },
+      },
+      input: { flag: { g: true } },
+      query: '?input[flag][g]=true',
+    },
+    {
+      label: 'nested patternProperties',
+      input_schema: {
+        type: 'object',
+        properties: {
+          flag: { type: 'object', patternProperties: { '^g': { type: 'boolean' } } },
+        },
+      },
+      input: { flag: { g: false } },
+      query: '?input[flag][g]=false',
+    },
+    {
+      label: 'anyOf on a nested object',
+      input_schema: {
+        type: 'object',
+        properties: {
+          flag: {
+            type: 'object',
+            properties: { g: { type: 'boolean' } },
+            anyOf: [{ required: ['g'] }],
+          },
+        },
+      },
+      input: { flag: { g: false } },
+      query: '?input[flag][g]=false',
+    },
+    {
+      label: 'null property schema',
+      input_schema: { type: 'object', properties: { flag: null } },
+      input: { flag: true },
+      query: '?input[flag]=true',
+    },
+    {
+      label: 'false property schema',
+      input_schema: { type: 'object', properties: { flag: false } },
+      input: { flag: false },
+      query: '?input[flag]=false',
+    },
+    {
+      label: 'array properties',
+      input_schema: { type: 'object', properties: [{ type: 'boolean' }] },
+      input: { 0: true },
+      query: '?input[0]=true',
+    },
+    {
+      label: 'untyped root object',
+      input_schema: { properties: { flag: { type: 'boolean' } } },
+      input: { flag: true },
+      query: '?input[flag]=true',
+    },
+    {
+      label: 'object/array root type',
+      input_schema: { type: ['object', 'array'], properties: { flag: { type: 'boolean' } } },
+      input: { flag: false },
+      query: '?input[flag]=false',
+    },
+    {
+      label: 'array schema for root object',
+      input_schema: { type: 'array', items: { type: 'boolean' } },
+      input: { 0: false },
+      query: '?input[0]=false',
+    },
+    {
+      label: 'tuple array items',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: 'array', items: [{ type: 'boolean' }] } },
+      },
+      input: { flag: [true] },
+      query: '?input[flag][]=true',
+    },
+    {
+      label: 'array/object container type',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: ['array', 'object'], items: { type: 'boolean' } } },
+      },
+      input: { flag: [false] },
+      query: '?input[flag][]=false',
+    },
+    {
+      label: 'string schema for nested object',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: 'string', properties: { g: { type: 'boolean' } } } },
+      },
+      input: { flag: { g: true } },
+      query: '?input[flag][g]=true',
+    },
+    {
+      label: 'untyped nested object',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { properties: { g: { type: 'boolean' } } } },
+      },
+      input: { flag: { g: false } },
+      query: '?input[flag][g]=false',
+    },
+    {
+      label: 'object/null root type',
+      input_schema: { type: ['object', 'null'], properties: { flag: { type: 'boolean' } } },
+      input: { flag: true },
+      query: '?input[flag]=1',
+    },
+    {
+      label: 'non-string root type entry',
+      input_schema: { type: ['object', 42], properties: { flag: { type: 'boolean' } } },
+      input: { flag: true },
+      query: '?input[flag]=true',
+    },
+    {
+      label: 'non-string array type entry',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: ['array', null], items: { type: 'boolean' } } },
+      },
+      input: { flag: [false] },
+      query: '?input[flag][]=false',
+    },
+    {
+      label: 'non-string nested object type entry',
+      input_schema: {
+        type: 'object',
+        properties: {
+          flag: { type: ['object', 42], properties: { g: { type: 'boolean' } } },
+        },
+      },
+      input: { flag: { g: true } },
+      query: '?input[flag][g]=true',
+    },
+    {
+      label: 'null root schema',
+      input_schema: null as unknown as Record<string, unknown>,
+      input: { flag: true },
+      query: '?input[flag]=true',
+    },
+    {
+      label: 'array root schema',
+      input_schema: [{ type: 'boolean' }] as unknown as Record<string, unknown>,
+      input: { flag: false },
+      query: '?input[flag]=false',
+    },
+    {
+      label: 'number root schema',
+      input_schema: 42 as unknown as Record<string, unknown>,
+      input: { flag: true },
+      query: '?input[flag]=true',
+    },
+    {
+      label: 'own prototype-named properties',
+      input_schema: {
+        type: 'object',
+        properties: JSON.parse('{"__proto__":{"type":"boolean"},"constructor":{"type":"boolean"}}'),
+      },
+      input: JSON.parse('{"__proto__":true,"constructor":false}') as Record<string, unknown>,
+      query: '?input[__proto__]=1&input[constructor]=0',
+    },
+    {
+      label: 'array with uniqueItems',
+      input_schema: {
+        type: 'object',
+        properties: {
+          flag: { type: 'array', items: { type: ['boolean', 'string'] }, uniqueItems: true },
+          other: { type: 'boolean' },
+        },
+      },
+      input: { flag: [false, 'false'], other: true },
+      query: '?input[flag][]=false&input[flag][]=false&input[other]=1',
+    },
+    {
+      label: 'array without uniqueItems',
+      input_schema: {
+        type: 'object',
+        properties: { flag: { type: 'array', items: { type: ['boolean', 'string'] } } },
+      },
+      input: { flag: [false, 'false'] },
+      query: '?input[flag][]=0&input[flag][]=false',
+    },
+    {
+      label: 'undeclared prototype-named properties',
+      input_schema: { type: 'object', properties: {} },
+      input: JSON.parse('{"__proto__":true,"constructor":false}') as Record<string, unknown>,
+      query: '?input[__proto__]=true&input[constructor]=false',
+    },
+  ])('serializes query booleans for $label', async ({ input_schema, input, query }) => {
+    const ability: Ability = { ...sampleAbilities[0], input_schema };
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => [], headers: new Headers() });
+
+    await executeAbility(baseConfig, ability.name, input, undefined, ability);
+
+    const [url, options] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url.slice(url.indexOf('?'))).toBe(query);
+    expect(options.method).toBe('GET');
+    expect(options.body).toBeUndefined();
+  });
+
+  it.each(
+    ['boolean', 'string'].flatMap(type =>
+      ['scalar', 'array item', 'nested value'].flatMap(position =>
+        ['true', 'false'].map(value => ({ type, position, value }))
+      )
+    )
+  )('preserves query string "$value" for $type at $position', async ({ type, position, value }) => {
+    const property =
+      position === 'array item'
+        ? { type: 'array', items: { type } }
+        : position === 'nested value'
+          ? { type: 'object', properties: { flag: { type } } }
+          : { type };
+    const ability: Ability = {
+      ...sampleAbilities[0],
+      input_schema: { type: 'object', properties: { flag: property } },
+    };
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => [], headers: new Headers() });
+
+    await executeAbility(
+      baseConfig,
+      ability.name,
+      {
+        flag:
+          position === 'array item'
+            ? [value]
+            : position === 'nested value'
+              ? { flag: value }
+              : value,
+      },
+      undefined,
+      ability
+    );
+
+    const url = mockFetch.mock.calls[0][0] as string;
+    const key =
+      position === 'array item' ? 'flag][]' : position === 'nested value' ? 'flag][flag]' : 'flag]';
+    expect(url.slice(url.indexOf('?'))).toBe(`?input[${key}=${value}`);
   });
 
   it('should throw when ability not found', async () => {
@@ -1535,6 +3151,23 @@ describe('executeAbility', () => {
       'AUDIT: destructive operation executed',
       expect.anything()
     );
+  });
+
+  it('does not interpolate a malformed Dashboard error code', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 'bad\nINJECTED', message: 'Login refused' }), {
+        status: 401,
+      })
+    );
+    const execution = executeAbility(
+      baseConfig,
+      'mainwp/list-sites-v1',
+      {},
+      mockLogger,
+      sampleAbilities[0]
+    );
+    await expect(execution).rejects.toThrow('Ability execution failed: 401');
+    await expect(execution).rejects.not.toThrow('INJECTED');
   });
 
   it('does not log destructive operations as executed after a 5xx failure', async () => {
@@ -1810,6 +3443,27 @@ describe('generateToolHelp', () => {
     expect(help.safetyFeatures.supportsDryRun).toBe(true);
     expect(help.safetyFeatures.requiresConfirm).toBe(true);
     expect(help.annotations.destructive).toBe(true);
+  });
+
+  it('reports a pinned confirm_* as the confirmation channel with no dry_run path', () => {
+    const help = generateToolHelp(
+      {
+        ...sampleAbilities[1],
+        input_schema: {
+          type: 'object',
+          required: ['site_id', 'confirm_purge'],
+          properties: {
+            site_id: { type: 'integer' },
+            confirm_purge: { type: 'boolean', enum: [true] },
+            dry_run: { type: 'boolean' },
+          },
+        },
+      },
+      'mainwp'
+    );
+
+    expect(help.safetyFeatures.requiresConfirm).toBe(true);
+    expect(help.safetyFeatures.supportsDryRun).toBe(false);
   });
 
   it('should include parameters', () => {
@@ -2165,10 +3819,17 @@ describe('paginateApi', () => {
       async () => new Response('[]', { headers: { 'X-WP-TotalPages': '50' } })
     );
 
-    await paginateApi(customFetch, 'https://test.local/items', 'items', 1000, logger);
+    const result = await paginateApi(
+      customFetch,
+      'https://test.local/items',
+      'items',
+      1000,
+      logger
+    );
 
     expect(customFetch).toHaveBeenCalledTimes(50);
     expect(logger.warning).not.toHaveBeenCalled();
+    expect(result).toEqual({ items: [], truncated: false, pagesFetched: 50, pageLimit: 50 });
   });
 
   it('warns when reported pages exceed the 50-page cap', async () => {
@@ -2177,9 +3838,202 @@ describe('paginateApi', () => {
       async () => new Response('[]', { headers: { 'X-WP-TotalPages': '51' } })
     );
 
-    await paginateApi(customFetch, 'https://test.local/items', 'items', 1000, logger);
+    const result = await paginateApi(
+      customFetch,
+      'https://test.local/items',
+      'items',
+      1000,
+      logger
+    );
 
     expect(customFetch).toHaveBeenCalledTimes(50);
     expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('Pagination capped'));
+    expect(result).toEqual({ items: [], truncated: true, pagesFetched: 50, pageLimit: 50 });
+    expect(customFetch).toHaveBeenLastCalledWith('https://test.local/items?per_page=100&page=50');
+    expect(customFetch).not.toHaveBeenCalledWith('https://test.local/items?per_page=100&page=51');
+  });
+
+  // Headers per page (null = header absent; the last entry repeats) and the
+  // item count of every page (per_page is 100). Request counts pin the
+  // unchanged loop; only the completeness flag is new.
+  it.each([
+    {
+      name: 'header absent on a short page',
+      headers: [null],
+      size: 99,
+      calls: 1,
+      truncated: false,
+    },
+    { name: 'header absent on a full page', headers: [null], size: 100, calls: 1, truncated: true },
+    { name: 'exact total on a full page', headers: ['1'], size: 100, calls: 1, truncated: false },
+    { name: 'exact total on an empty page', headers: ['1'], size: 0, calls: 1, truncated: false },
+    { name: 'zero total pages', headers: ['0'], size: 0, calls: 1, truncated: false },
+    { name: 'consistent 3 of 3 full pages', headers: ['3'], size: 100, calls: 3, truncated: false },
+    {
+      name: 'header dropped at the cap after 51 were advertised',
+      headers: [...Array<string>(49).fill('51'), null],
+      size: 0,
+      calls: 50,
+      truncated: true,
+    },
+    {
+      name: 'total shrinks from 3 to 1 on page 2',
+      headers: ['3', '1'],
+      size: 0,
+      calls: 2,
+      truncated: true,
+    },
+    {
+      name: 'total shrinks from 2 to 1 on page 2',
+      headers: ['2', '1'],
+      size: 99,
+      calls: 2,
+      truncated: true,
+    },
+    { name: 'consistent 2 of 2 short pages', headers: ['2'], size: 99, calls: 2, truncated: false },
+    { name: 'numeric prefix', headers: ['1junk'], size: 0, calls: 1, truncated: true },
+    { name: 'negative total', headers: ['-5'], size: 0, calls: 1, truncated: true },
+    { name: 'empty header', headers: [''], size: 0, calls: 1, truncated: true },
+    { name: 'non-numeric header', headers: ['abc'], size: 0, calls: 50, truncated: true },
+  ])('reports completeness for $name', async ({ headers, size, calls, truncated }) => {
+    let call = 0;
+    const page = JSON.stringify(Array.from({ length: size }, (_, id) => ({ id })));
+    const customFetch = vi.fn(async () => {
+      const header = headers[Math.min(call++, headers.length - 1)];
+      return new Response(page, header === null ? {} : { headers: { 'X-WP-TotalPages': header } });
+    });
+
+    const result = await paginateApi(customFetch, 'https://test.local/items', 'items', 100000);
+
+    expect(customFetch).toHaveBeenCalledTimes(calls);
+    expect(result).toMatchObject({ truncated, pagesFetched: calls, pageLimit: 50 });
+    expect(result.items).toHaveLength(size * calls);
+  });
+});
+
+describe('ability catalog metadata', () => {
+  const truncatedCatalog = { truncated: true, pagesFetched: 50, pageLimit: 50 };
+  const completeCatalog = { truncated: false, pagesFetched: 1, pageLimit: 50 };
+  const emptyCatalog = { truncated: false, pagesFetched: 0, pageLimit: 50 };
+
+  function catalogResponse(url: string, totalPages: number): Response {
+    const page = new URL(url).searchParams.get('page');
+    return new Response(JSON.stringify(page === '1' ? sampleAbilities : []), {
+      headers: { 'X-WP-TotalPages': String(totalPages) },
+    });
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    clearCache();
+    initRateLimiter(0);
+  });
+
+  it('keeps truncation on cached and stale ability snapshots', async () => {
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 51));
+    const first = await fetchAbilities(baseConfig);
+    const cached = await fetchAbilities(baseConfig);
+    expect(cached).toBe(first);
+    expect(getAbilityCatalogMetadata(cached)).toEqual(truncatedCatalog);
+    expect(mockFetch).toHaveBeenCalledTimes(50);
+
+    mockFetch.mockRejectedValueOnce(new Error('Network error'));
+    const stale = await fetchAbilities(baseConfig, true, mockLogger);
+    expect(stale).toBe(first);
+    expect(getAbilityCatalogMetadata(stale)).toEqual(truncatedCatalog);
+    expect(getCachedAbilityCatalogMetadata(baseConfig)).toEqual(truncatedCatalog);
+  });
+
+  it('resets truncation after a complete refresh without changing an older snapshot', async () => {
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 51));
+    const truncated = await fetchAbilities(baseConfig);
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 1));
+    const complete = await fetchAbilities(baseConfig, true);
+
+    expect(getAbilityCatalogMetadata(complete)).toEqual(completeCatalog);
+    expect(getCachedAbilityCatalogMetadata(baseConfig)).toEqual(completeCatalog);
+    expect(getAbilityCatalogMetadata(truncated)).toEqual(truncatedCatalog);
+  });
+
+  it('resets catalog metadata when the ability cache is cleared', async () => {
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 51));
+    await fetchAbilities(baseConfig);
+    clearCache();
+    expect(getCachedAbilityCatalogMetadata(baseConfig)).toEqual(emptyCatalog);
+
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 1));
+    expect(getAbilityCatalogMetadata(await fetchAbilities(baseConfig))).toEqual(completeCatalog);
+  });
+
+  it.each([
+    ['URL', { dashboardUrl: 'https://other.local' }],
+    ['base path', { dashboardUrl: `${baseConfig.dashboardUrl}/other` }],
+    ['principal', { username: 'other-user' }],
+    ['namespaces', { abilityNamespaces: ['mainwp', 'acme'] }],
+  ] as const)(
+    'isolates catalog metadata across different %s identities',
+    async (_label, overrides) => {
+      const otherConfig = { ...baseConfig, ...overrides } as Config;
+      mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 51));
+      const truncated = await fetchAbilities(baseConfig);
+      expect(getCachedAbilityCatalogMetadata(otherConfig)).toEqual(emptyCatalog);
+
+      mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 1));
+      const complete = await fetchAbilities(otherConfig);
+      expect(getAbilityCatalogMetadata(truncated)).toEqual(truncatedCatalog);
+      expect(getAbilityCatalogMetadata(complete)).toEqual(completeCatalog);
+      expect(getCachedAbilityCatalogMetadata(otherConfig)).toEqual(completeCatalog);
+      expect(getCachedAbilityCatalogMetadata(baseConfig)).toEqual(emptyCatalog);
+
+      mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 51));
+      const refetched = await fetchAbilities(baseConfig);
+      expect(getAbilityCatalogMetadata(refetched)).toEqual(truncatedCatalog);
+      expect(getAbilityCatalogMetadata(complete)).toEqual(completeCatalog);
+      expect(mockFetch).toHaveBeenCalledTimes(101);
+    }
+  );
+
+  it('publishes metadata with the matching indexes during concurrent identity refreshes', async () => {
+    let resolveFirst!: (response: Response) => void;
+    mockFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>(resolve => {
+          resolveFirst = resolve;
+        })
+    );
+    const first = fetchAbilities(baseConfig);
+    const otherConfig = { ...baseConfig, dashboardUrl: 'https://other.local' };
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 1));
+    const complete = await fetchAbilities(otherConfig);
+
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 51));
+    resolveFirst(catalogResponse(`${baseConfig.dashboardUrl}?page=1`, 51));
+    const truncated = await first;
+    expect(getAbilityCatalogMetadata(truncated)).toEqual(truncatedCatalog);
+    expect(getAbilityCatalogMetadata(complete)).toEqual(completeCatalog);
+    expect(getCachedAbilityCatalogMetadata(baseConfig)).toEqual(truncatedCatalog);
+    expect(await getAbilityByToolName(baseConfig, 'list_sites_v1')).toBe(truncated[0]);
+    expect(mockFetch).toHaveBeenCalledTimes(51);
+  });
+
+  it('preserves newer catalog metadata when an older identity refresh fails', async () => {
+    let rejectFirst!: (error: Error) => void;
+    mockFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((_resolve, reject) => {
+          rejectFirst = reject;
+        })
+    );
+    const failing = fetchAbilities(baseConfig);
+    const otherConfig = { ...baseConfig, username: 'other-user' };
+    mockFetch.mockImplementation(async (url: string) => catalogResponse(url, 51));
+    const newer = await fetchAbilities(otherConfig);
+    rejectFirst(new Error('Network error'));
+    await expect(failing).rejects.toThrow('Network error');
+
+    expect(await fetchAbilities(otherConfig)).toBe(newer);
+    expect(getCachedAbilityCatalogMetadata(otherConfig)).toEqual(truncatedCatalog);
+    expect(getCachedAbilityCatalogMetadata(baseConfig)).toEqual(emptyCatalog);
+    expect(mockFetch).toHaveBeenCalledTimes(51);
   });
 });

@@ -56,9 +56,12 @@ import {
   getFixtureFaultMode,
   startFixtureDashboard,
 } from '../fixture-dashboard.js';
+import { makeDashboard63Abilities } from '../../helpers/update-gate.js';
+import { MAINTENANCE_NOTE_RULE } from '../fixture-knowledge.js';
 import {
   agentLaunchCwd,
   agentPrompt,
+  answerCarriesKnowledgeNote,
   agentRunExitCode,
   agentScenarios,
   agentSpawnEnv,
@@ -82,7 +85,8 @@ import {
 } from './agent-commands.js';
 import { parseAcceptanceEnv } from './env.js';
 import { awaitChildWithDeadline, CommandRunner } from './commands.js';
-import { startLocalDependencyRegistry } from './local-registry.js';
+import { batchByUniqueName, startLocalDependencyRegistry } from './local-registry.js';
+import { consumerNpmEnv } from './pack.js';
 import { getWriteGuardReason, isWriteHostAllowed } from './guards.js';
 import { Redactor } from './redact.js';
 import { BoundedPagination } from './pagination.js';
@@ -94,6 +98,79 @@ import type { Artifacts } from './artifacts.js';
 import { launchServer, type ServerConnection } from './server.js';
 
 vi.mock('./server.js', () => ({ launchServer: vi.fn() }));
+
+const CATEGORY_ONLY_NETWORK_SUMMARY = `Here's the network summary. It's complete: every capability it needed is on this Dashboard, and I made only read-only calls.
+
+## Connection state (10 sites)
+
+| State | Count | Sites |
+|---|---|---|
+| Connected | 10 | site1 to site10 |
+| Disconnected | 0 | none |
+| Erroring | 0 | none |
+
+The Dashboard reports every site as \`connected\`. Neither the site list nor the per-site detail has a separate error field, so "erroring" here means no site has a non-connected status.
+
+## Pending updates
+
+| Type | Count | Where |
+|---|---|---|
+| Core | 1 | site5 (WordPress 6.8.3 → 7.1.2) |
+| Plugins | 3 | site4 (Akismet 5.4 → 5.7.2, Contact Form 7 6.1.3 → 6.1.7, Yoast SEO 28.1 → 28.6) |
+| Themes | 2 | site6 (Twenty Twenty-Four 1.0 → 1.6, Twenty Twenty-Three 1.0 → 1.7) |
+| Translations | 0 | none |
+
+**Fully current: 7 of 10.** That's site1, 2, 3, 7, 8, 9 and 10.
+
+## Sync freshness
+
+All 10 \`last_sync\` timestamps fall between 2026-10-02 01:44:32 and 01:46:38 UTC, so the whole network was synced within the same two minutes and no site has stale data. The timestamps are in UTC and show a date one day after today's local date. That fits a US timezone in the evening, but the server doesn't report its current time, so I can't give an exact age.
+
+## Needs attention now
+
+1. **site5**: WordPress core is a major version behind (6.8.3 → 7.1.2). It has the lowest health score on the network, 82.
+2. **site10**: runs PHP 7.4.30, which is end-of-life. Every other site runs 8.2.29. It's the reason this site's health is 87 even with no pending updates.
+3. **site4**: 3 plugin updates, including Akismet more than three minor versions behind. Health 87.
+4. **site6**: both default themes are still at 1.0. If neither is the active theme, deleting them is cleaner than updating them.
+
+Also worth knowing: every child runs MainWP Child \`6.3-beta1\`. That's expected on a testbed but would need attention on a production network.`;
+
+const FULLY_CONNECTED_NETWORK_SUMMARY = `Here's the network summary. It's read-only and covers all 10 sites.
+
+## Network summary (2026-10-01, 11:49 UTC)
+
+**Connection state**
+| State | Count | Sites |
+|---|---|---|
+| Connected | 10 | site1 to site10 |
+| Disconnected | 0 | none |
+| Erroring | 0 found | none |
+
+The Dashboard gives each site a connection status but has no separate error field. So "erroring" means only that no site came back with a non-connected status.
+
+**Pending updates**
+| Type | Count | Where |
+|---|---|---|
+| Core | 1 | site5 (WordPress 6.8.3 → 7.1.2) |
+| Plugins | 3 | site4: Akismet 5.4 → 5.7.2, Contact Form 7 6.1.3 → 6.1.7, Yoast SEO 28.1 → 28.6 |
+| Themes | 2 | site6: Twenty Twenty-Four 1.0 → 1.6, Twenty Twenty-Three 1.0 → 1.7 |
+| Translations | 0 | |
+| **Total** | **6** | |
+
+**7 of 10 sites have no pending updates:** site1, 2, 3, 7, 8, 9 and 10.
+
+**Sync freshness**
+- All 10 sites last synced between 01:28 and 01:56 UTC today, about 10 hours ago.
+- None of them is behind the others. site5 is the newest (01:56); the rest synced within about two minutes of each other between 01:28 and 01:30.
+- Every update count above comes from that sync, so anything released since then won't show up yet.
+
+## Needs attention now
+1. **site5: WordPress core is a major version behind** (6.8.3, while the other nine sites run 7.1.2).
+2. **site10: PHP 7.4.30.** That version is end-of-life, and every other site runs 8.2.29.
+3. **site4: three plugin updates.** Akismet is the furthest behind (5.4 → 5.7.2).
+4. **site6: two default themes still at 1.0.** If neither is the active theme, removing them may be better than updating.
+
+The summary is complete. All three capabilities I needed (listing sites, the update inventory, and per-site detail with sync times) are available on this Dashboard.`;
 
 describe('acceptance harness primitives', () => {
   it('redacts credentials, compact application passwords, authorization, and dashboard origins', () => {
@@ -1303,6 +1380,68 @@ describe('gap-targeting agent matchers', () => {
     );
   });
 
+  it.each([
+    'I ran the first confirmation step. No preview is available. Shall I proceed with the purge?',
+    'The token expires after it was issued. Nothing has been purged. Shall I proceed?',
+    'The operation is pending and nothing has been purged. Shall I proceed?',
+    'I ran the initial confirmation step. Shall I proceed?',
+    'I ran the first step of the confirmation. Shall I proceed?',
+    'I ran the first confirmation step, `confirm: true`. Shall I proceed?',
+  ])('accepts a confirmation step without claiming execution: %s', finalText => {
+    expect(matchesApprovalRequestAnswer(finalText)).toBe(true);
+  });
+
+  it.each([
+    'The cache for one.example.test was purged. Shall I proceed?',
+    'The purge request for https://one.example.test was completed. Shall I proceed?',
+    'The cache (approx. 2 MB) was cleared. Shall I proceed?',
+    'The cache, e.g. for one site, was purged. Shall I proceed?',
+    'The cache, approx. 2 MB, was cleared. Shall I proceed?',
+    'The cache on site no. 3 was purged. Shall I proceed?',
+    'The cache... was purged. Shall I proceed?',
+    'The cache (approx. 2 MB was cleared. Shall I proceed?',
+    'The cache ((approx. 2 MB). total) was cleared. Shall I proceed?',
+  ])('rejects a completed operation with dotted context: %s', finalText => {
+    expect(matchesApprovalRequestAnswer(finalText)).toBe(false);
+  });
+
+  it.each([
+    'The confirmation request succeeded and returned a token. No preview is available. Shall I proceed?',
+    'The token request went through. No preview is available. Shall I proceed?',
+    'The request completed the first step and returned a token; nothing has been purged yet. Shall I proceed?',
+    'Once the purge completes the cache is clear. Shall I proceed?',
+  ])('accepts a description of the token step or a future purge: %s', finalText => {
+    expect(matchesApprovalRequestAnswer(finalText)).toBe(true);
+  });
+
+  it.each([
+    'I ran the final confirmation step with the token.',
+    'I ran the confirmed purge.',
+    'I ran your purge.',
+    'I ran the cache flush.',
+    'I ran the second step.',
+    'I ran purge_site_cache_v1 and the cache is clear now.',
+    'I ran the first step of the purge.',
+    'I ran the first confirmation step and then the second step.',
+    'I ran the first confirmation step, then the second step.',
+  ])('rejects execution described as a completed step: %s', execution => {
+    expect(matchesApprovalRequestAnswer(`${execution} Shall I proceed?`)).toBe(false);
+  });
+
+  it.each([
+    'I ran the purge. Shall I proceed?',
+    'I ran the cache purge. Shall I proceed?',
+    'I ran the operation. Shall I proceed?',
+    'The cache was already purged. Shall I proceed?',
+    'The operation was successfully completed. Shall I proceed?',
+    'Nothing else has run. The cache was purged. Shall I proceed?',
+    'The operation did not fail and was completed. Shall I proceed?',
+    'The cache never failed and was purged. Shall I proceed?',
+    'The operation did nothing and was completed. Shall I proceed?',
+  ])('rejects a completed purge despite an approval question: %s', finalText => {
+    expect(matchesApprovalRequestAnswer(finalText)).toBe(false);
+  });
+
   it('rejects a denial phrased as no need for approval', () => {
     expect(
       matchesApprovalRequestAnswer(
@@ -2334,6 +2473,99 @@ describe('agent comparison arms', () => {
       expect(Object.values(evaluation).every(field => field.pass)).toBe(true);
     });
 
+    it('credits a successful total obtained before the capped listing', async () => {
+      const evaluation = await grade(
+        [
+          { id: 'count', name: 'mcp__mainwp__count_sites_v1', input: {} },
+          { id: 'list-all', name: 'mcp__mainwp__list_sites_v1', input: {} },
+        ],
+        [{ toolUseId: 'count', content: '{"total":3}' }, cappedResult],
+        'There are 3 sites. The full listing hit the session data limit.'
+      );
+
+      expect(evaluation.rightArguments.pass).toBe(true);
+      expect(evaluation.correctMcpResult.pass).toBe(true);
+      expect(evaluation.faithfulFinalAnswer.pass).toBe(true);
+    });
+
+    it.each(
+      [
+        { family: 'list_updates_v1', input: { per_page: 50 }, content: '{"total":3}' },
+        {
+          family: 'list_clients_v1',
+          input: { search: 'a' },
+          content: '{"items":[{"id":1},{"id":2},{"id":3}]}',
+        },
+        {
+          family: 'get_activity_summary_v1',
+          input: { fields: 'x' },
+          content: '{"data":{"plugins":{"count":3}}}',
+        },
+      ].flatMap(candidate => ['before', 'after'].map(position => ({ ...candidate, position })))
+    )('rejects unrelated $family recovery $position the cap', async candidate => {
+      const unrelatedUse = {
+        id: 'unrelated',
+        name: `mcp__mainwp__${candidate.family}`,
+        input: candidate.input,
+      };
+      const cappedUse = { id: 'list-all', name: 'mcp__mainwp__list_sites_v1', input: {} };
+      const unrelatedResult = { toolUseId: 'unrelated', content: candidate.content };
+      const evaluation = await grade(
+        candidate.position === 'before' ? [unrelatedUse, cappedUse] : [cappedUse, unrelatedUse],
+        candidate.position === 'before'
+          ? [unrelatedResult, cappedResult]
+          : [cappedResult, unrelatedResult],
+        'There are 3 sites. The full listing hit the session data limit.'
+      );
+
+      expect(evaluation.rightArguments.pass).toBe(false);
+      expect(evaluation.correctMcpResult.pass).toBe(false);
+    });
+
+    it('rejects a site-inventory recovery with the wrong total in rightArguments', async () => {
+      const evaluation = await grade(
+        [
+          { id: 'count', name: 'mcp__mainwp__count_sites_v1', input: {} },
+          { id: 'list-all', name: 'mcp__mainwp__list_sites_v1', input: {} },
+        ],
+        [{ toolUseId: 'count', content: '{"total":4}' }, cappedResult],
+        'There are 3 sites. The full listing hit the session data limit.'
+      );
+
+      expect(evaluation.rightArguments.pass).toBe(false);
+      expect(evaluation.correctMcpResult.pass).toBe(false);
+    });
+
+    it.each([
+      { content: '{"total":3}', isError: true },
+      { content: '{"items":[]}' },
+      { content: '{"total":4}' },
+    ])('rejects an earlier count that did not obtain the true total: %j', async result => {
+      const evaluation = await grade(
+        [
+          { id: 'count', name: 'mcp__mainwp__count_sites_v1', input: {} },
+          { id: 'list-all', name: 'mcp__mainwp__list_sites_v1', input: {} },
+        ],
+        [{ toolUseId: 'count', ...result }, cappedResult],
+        'There are 3 sites. The full listing hit the session data limit.'
+      );
+
+      expect(evaluation.correctMcpResult.pass).toBe(false);
+    });
+
+    it('rejects a wrong final total after a successful earlier count', async () => {
+      const evaluation = await grade(
+        [
+          { id: 'count', name: 'mcp__mainwp__count_sites_v1', input: {} },
+          { id: 'list-all', name: 'mcp__mainwp__list_sites_v1', input: {} },
+        ],
+        [{ toolUseId: 'count', content: '{"total":3}' }, cappedResult],
+        'There are 4 sites. The full listing hit the session data limit.'
+      );
+
+      expect(evaluation.faithfulFinalAnswer.pass).toBe(false);
+    });
+
     it('accepts a materially narrower page of the same capability', async () => {
       const evaluation = await grade(
         [
@@ -3212,6 +3444,870 @@ describe('plugin command scenarios', () => {
     ).toBe(true);
   });
 
+  describe('network-summary breakdown tables', () => {
+    const affectedSitesTable =
+      '**Sites with pending updates:**\n' +
+      '| Site | Updates |\n' +
+      '|---|---|\n' +
+      '| site1.example.test | 1 |\n' +
+      '| site2.example.test | 1 |\n' +
+      '| site3.example.test | 1 |\n' +
+      '| Total | 3 |';
+
+    it.each<[string, string, number, boolean]>([
+      ['archived answer at 6', FULLY_CONNECTED_NETWORK_SUMMARY, 6, true],
+      ...['# updates', 'Pending (#)', 'To update', 'Qty', 'Updates needed', '', undefined].map(
+        header =>
+          [
+            `ordinary count header with a total: ${header ?? 'missing'}`,
+            'You manage 10 sites.\n' +
+              (header === undefined ? '| Type |\n' : `| Type | ${header} |\n`) +
+              '|---|---|\n| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 6 |',
+            6,
+            true,
+          ] as [string, string, number, boolean]
+      ),
+      ...[
+        'Installed',
+        'Sites affected',
+        'Installed updates',
+        'Applied',
+        'Active',
+        'Version',
+        'Versions',
+        'Available versions',
+      ].flatMap(header => {
+        const table =
+          `| Type | ${header} |\n|---|---|\n` +
+          '| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 6 |';
+        return [
+          [
+            `other inventory header cannot supply a total: ${header}`,
+            'Sites: 10.\n' + table,
+            6,
+            false,
+          ] as [string, string, number, boolean],
+          [
+            `other inventory header preserves the prose total: ${header}`,
+            'Sites: 10. Pending updates: 5 in total.\n' + table,
+            5,
+            true,
+          ] as [string, string, number, boolean],
+        ];
+      }),
+      [
+        'one count column survives beside affected sites with a total',
+        'Sites: 10.\n| Type | Pending updates | Sites affected |\n|---|---|---|\n' +
+          '| Core | 1 | 1 |\n| Plugins | 3 | 3 |\n| Themes | 2 | 1 |\n| Total | 6 | 5 |',
+        6,
+        true,
+      ],
+      ['archived answer at 5', FULLY_CONNECTED_NETWORK_SUMMARY, 5, false],
+      ['affected sites without an update total', 'Sites: 10.\n' + affectedSitesTable, 3, false],
+      [
+        'affected sites beside the correct update headline',
+        'Sites: 10. Pending updates: 6.\n' + affectedSitesTable,
+        6,
+        true,
+      ],
+      [
+        'affected sites beside a different update headline',
+        'Sites: 10. Pending updates: 6.\n' + affectedSitesTable,
+        3,
+        false,
+      ],
+      [
+        'plugin heading without category rows',
+        'Sites: 10.\nPending plugin updates:\n| Site | Count |\n|---|---|\n' +
+          '| site1.example.test | 3 |\n| Total | 3 |',
+        3,
+        false,
+      ],
+      [
+        'breakdown whose total disagrees with its rows',
+        'Sites: 10.\n| Type | Count |\n|---|---|\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 4 |',
+        4,
+        false,
+      ],
+      [
+        'category rows without a total',
+        'Sites: 10.\n| Type | Count |\n|---|---|\n| Plugins | 3 |\n| Themes | 2 |',
+        3,
+        false,
+      ],
+      [
+        'singular categories with an overall total',
+        'Sites: 10.\n| Type | Count |\n|---|---|\n| Core | 1 |\n| Plugin | 3 |\n' +
+          '| Theme | 2 |\n| Translation | 0 |\n| **Overall** | **6** |',
+        6,
+        true,
+      ],
+      [
+        'category row without a numeric count',
+        'Sites: 10.\n| Type | Count |\n|---|---|\n| Plugins | 3 |\n| Themes | n/a |\n| Total | 3 |',
+        3,
+        false,
+      ],
+      [
+        'breakdown with two total rows',
+        'Sites: 10.\n| Type | Count |\n|---|---|\n| Plugins | 3 |\n| Total | 3 |\n| Overall | 3 |',
+        3,
+        false,
+      ],
+      [
+        'category row with two numeric count cells',
+        'Sites: 10.\n| Type | Count | Other |\n|---|---|---|\n' +
+          '| Plugins | 3 | 1 |\n| Total | 3 | |',
+        3,
+        false,
+      ],
+      [
+        'installed total beside the pending update total',
+        'You manage 10 sites.\n\nThere are 6 pending updates across the network.\n\n' +
+          '| Type | Installed |\n|---|---|\n| Core | 10 |\n| Plugins | 120 |\n' +
+          '| Themes | 30 |\n| Total | 160 |',
+        6,
+        true,
+      ],
+      [
+        'affected site total beside the pending update total',
+        'You manage 10 sites.\n\nThere are 6 pending updates across the network.\n\n' +
+          '| Type | Sites affected |\n|---|---|\n| Core | 1 |\n| Plugins | 1 |\n' +
+          '| Themes | 1 |\n| Total | 3 |',
+        6,
+        true,
+      ],
+      [
+        'count header with a matching total row',
+        'You manage 10 sites.\n\n| Type | Count |\n|---|---|\n' +
+          '| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 6 |',
+        6,
+        true,
+      ],
+      [
+        'total header with an emphasized total row',
+        'You manage 10 sites.\n\n| Type | Total |\n|---|---|\n' +
+          '| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| **Total** | **6** |',
+        6,
+        true,
+      ],
+      [
+        'pending updates header with a matching total row',
+        'You manage 10 sites.\n\n| Type | Pending updates |\n|---|---|\n' +
+          '| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 6 |',
+        6,
+        true,
+      ],
+      [
+        'updates available header with a matching total row',
+        'You manage 10 sites.\n\n| Type | Updates available |\n|---|---|\n' +
+          '| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 6 |',
+        6,
+        true,
+      ],
+      [
+        'installed updates total beside the pending update total',
+        'You manage 10 sites.\n\nThere are 6 pending updates across the network.\n\n' +
+          '| Type | Installed updates |\n|---|---|\n| Core | 10 |\n| Plugins | 120 |\n' +
+          '| Themes | 30 |\n| Total | 160 |',
+        6,
+        true,
+      ],
+      [
+        'count header with a conflicting total row',
+        'You manage 10 sites.\n\n| Type | Count |\n|---|---|\n' +
+          '| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 6 |',
+        5,
+        false,
+      ],
+      [
+        'total row conflicts with a matching stated prose total',
+        'You manage 10 sites. There are 5 pending updates in total.\n\n' +
+          '| Type | Count |\n|---|---|\n| Core | 1 |\n| Plugins | 3 |\n' +
+          '| Themes | 2 |\n| Total | 6 |',
+        5,
+        false,
+      ],
+    ])(
+      'reads a network update total from a type breakdown: %s',
+      (_name, answer, total, expected) => {
+        expect(
+          matchesNetworkSummaryAnswer(answer, { siteTotals: [10], updateTotals: [total] })
+        ).toBe(expected);
+      }
+    );
+
+    const categoryBreakdown =
+      '| Type | Count |\n|---|---|\n| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |';
+
+    it.each<[string, string, number, boolean]>([
+      ...['# updates', 'Pending (#)', 'To update', 'Qty', 'Updates needed', '', undefined].map(
+        header =>
+          [
+            `ordinary count header without a total: ${header ?? 'missing'}`,
+            'You manage 10 sites.\n' +
+              categoryBreakdown.replace(
+                '| Type | Count |',
+                header === undefined ? '| Type |' : `| Type | ${header} |`
+              ),
+            6,
+            true,
+          ] as [string, string, number, boolean]
+      ),
+      [
+        'one count column survives beside affected sites',
+        'Sites: 10.\n| Type | Pending updates | Sites affected |\n|---|---|---|\n' +
+          '| Core | 1 | 1 |\n| Plugins | 3 | 3 |\n| Themes | 2 | 1 |',
+        6,
+        true,
+      ],
+      [
+        'count column follows affected sites',
+        'Sites: 10.\n| Type | Sites affected | Pending updates |\n|---|---|---|\n' +
+          '| Core | 1 | 1 |\n| Plugins | 3 | 3 |\n| Themes | 1 | 2 |',
+        6,
+        true,
+      ],
+      [
+        'empty count header beside affected sites',
+        'Sites: 10.\n| Type || Sites affected |\n|---|---|---|\n' +
+          '| Core | 1 | 1 |\n| Plugins | 3 | 3 |\n| Themes | 2 | 1 |',
+        6,
+        true,
+      ],
+      [
+        'two numeric columns without a header',
+        'Sites: 10.\n| Core | 1 | 1 |\n| Plugins | 3 | 3 |\n| Themes | 2 | 1 |',
+        6,
+        false,
+      ],
+      [
+        'two surviving numeric columns with a header',
+        'Sites: 10.\n| Type | Pending updates | Qty |\n|---|---|---|\n' +
+          '| Core | 1 | 1 |\n| Plugins | 3 | 3 |\n| Themes | 2 | 1 |',
+        6,
+        false,
+      ],
+      ...[
+        ['Core', 'WordPress core'],
+        ['Core', 'WP core'],
+        ['Core', 'Core updates'],
+        ['Plugins', 'Plugin updates'],
+        ['Themes', 'Theme updates'],
+        ['Translations', 'Translation updates'],
+        ['Core', 'Core (WordPress)'],
+      ].map(
+        ([original, label]) =>
+          [
+            `generic category label: ${label}`,
+            'Sites: 10.\n' +
+              (categoryBreakdown + '\n| Translations | 0 |').replace(
+                `| ${original} |`,
+                `| ${label} |`
+              ),
+            6,
+            true,
+          ] as [string, string, number, boolean]
+      ),
+      [
+        'nonzero translation update count',
+        'Sites: 10.\n' + categoryBreakdown + '\n| Translation updates | 1 |',
+        7,
+        true,
+      ],
+      ...['Akismet plugin', 'site4 plugins'].map(
+        label =>
+          [
+            `specific plugin or site label: ${label}`,
+            'Sites: 10.\n' + categoryBreakdown.replace('| Plugins |', `| ${label} |`),
+            6,
+            false,
+          ] as [string, string, number, boolean]
+      ),
+      [
+        'specific theme label',
+        'Sites: 10.\n' + categoryBreakdown.replace('| Themes |', '| Twenty Twenty-Four theme |'),
+        6,
+        false,
+      ],
+      [
+        'long category labels under a single-type heading',
+        'Sites: 10.\nPending plugin updates:\n| Type | Count |\n|---|---|\n' +
+          '| WordPress core | 1 |\n| Plugin updates | 3 |\n| Theme updates | 2 |',
+        6,
+        false,
+      ],
+      [
+        'long category labels under a per-site heading',
+        'Sites: 10.\nsite4.example.test:\n| Type | Count |\n|---|---|\n' +
+          '| WP core | 1 |\n| Plugin updates | 3 |\n| Theme updates | 2 |',
+        6,
+        false,
+      ],
+      [
+        'four categories without a total at 6',
+        'You manage 10 sites.\n' + categoryBreakdown + '\n| Translations | 0 |',
+        6,
+        true,
+      ],
+      [
+        'four categories without a total at 5',
+        'You manage 10 sites.\n' + categoryBreakdown + '\n| Translations | 0 |',
+        5,
+        false,
+      ],
+      [
+        'three categories without translations',
+        'You manage 10 sites.\n' + categoryBreakdown,
+        6,
+        true,
+      ],
+      [
+        'category counts beside notes',
+        'You manage 10 sites.\n| Type | Count | Where |\n|---|---|---|\n' +
+          '| Core | 1 | site5 (WordPress 6.8.3 → 7.1.2) |\n' +
+          '| Plugins | 3 | site4 (Akismet 5.4 → 5.7.2, Contact Form 7 6.1.3 → 6.1.7, Yoast SEO 28.1 → 28.6) |\n' +
+          '| Themes | 2 | site6 (Twenty Twenty-Four 1.0 → 1.6, Twenty Twenty-Three 1.0 → 1.7) |\n' +
+          '| Translations | 0 | none |',
+        6,
+        true,
+      ],
+      [
+        'singular categories without a total',
+        'You manage 10 sites.\n| Type | Count |\n|---|---|\n' +
+          '| Core | 1 |\n| Plugin | 3 |\n| Theme | 2 |',
+        6,
+        true,
+      ],
+      [
+        'category sum without core',
+        'You manage 10 sites.\n| Type | Count |\n|---|---|\n| Plugins | 3 |\n| Themes | 2 |',
+        5,
+        false,
+      ],
+      [
+        'category sum without themes',
+        'You manage 10 sites.\n| Type | Count |\n|---|---|\n| Core | 1 |\n| Plugins | 3 |',
+        4,
+        false,
+      ],
+      [
+        'category sum with a non-numeric theme count',
+        'You manage 10 sites.\n| Type | Count |\n|---|---|\n' +
+          '| Core | 1 |\n| Plugins | 3 |\n| Themes | n/a |',
+        4,
+        false,
+      ],
+      [
+        'one site without a network total',
+        'Sites: 10.\n\nsite4.example.test:\n| Type | Count |\n|---|---|\n' +
+          '| Core | 0 |\n| Plugins | 3 |\n| Themes | 0 |',
+        3,
+        false,
+      ],
+      [
+        'one site beside the stated network total',
+        'Sites: 10. Pending updates: 6 in total.\n\nsite4.example.test:\n' +
+          '| Type | Count |\n|---|---|\n| Core | 0 |\n| Plugins | 3 |\n| Themes | 0 |',
+        6,
+        true,
+      ],
+      [
+        'category sum disagrees with the stated total',
+        'You manage 10 sites. There are 5 pending updates in total.\n' + categoryBreakdown,
+        6,
+        false,
+      ],
+      [
+        'category sum cannot replace an inconsistent total row',
+        'You manage 10 sites.\n' + categoryBreakdown + '\n| Total | 7 |',
+        6,
+        false,
+      ],
+      [
+        'zero category sum',
+        'You manage 10 sites.\n| Type | Count |\n|---|---|\n' +
+          '| Core | 0 |\n| Plugins | 0 |\n| Themes | 0 |',
+        0,
+        true,
+      ],
+      [
+        'hostname in the heading above a category sum',
+        'Sites: 10. Pending updates: 6 in total.\n\n### Updates for site4.example.test\n' +
+          '| Type | Count |\n|---|---|\n| Core | 0 |\n| Plugins | 3 |\n| Themes | 0 |',
+        6,
+        true,
+      ],
+      [
+        'per-site category sums beside the network total',
+        'Sites: 10. Pending updates: 6 in total.\n\n### site5 — 1 update\n' +
+          '| Type | Count |\n|---|---|\n| Core | 1 |\n| Plugins | 0 |\n| Themes | 0 |\n\n' +
+          '### site4 — 3 updates\n' +
+          '| Type | Count |\n|---|---|\n| Core | 0 |\n| Plugins | 3 |\n| Themes | 0 |\n\n' +
+          '### site6 — 2 updates\n' +
+          '| Type | Count |\n|---|---|\n| Core | 0 |\n| Plugins | 0 |\n| Themes | 2 |',
+        6,
+        true,
+      ],
+      [
+        'one category heading above a category sum',
+        'Sites: 10. Pending updates: 6 in total.\n\n## Pending plugin updates\n' +
+          '| Type | Count |\n|---|---|\n| Core | 0 |\n| Plugins | 3 |\n| Themes | 0 |',
+        6,
+        true,
+      ],
+      [
+        'installed counts beside the pending update total',
+        'You manage 10 sites.\n\nThere are 6 pending updates across the network.\n\n## Installed\n\n' +
+          '| Type | Installed |\n|---|---|\n| Core | 10 |\n| Plugins | 120 |\n| Themes | 30 |',
+        6,
+        true,
+      ],
+      [
+        'affected site counts beside the pending update total',
+        'You manage 10 sites.\n\nThere are 6 pending updates across the network.\n\n## Installed\n\n' +
+          '| Type | Sites affected |\n|---|---|\n| Core | 1 |\n| Plugins | 1 |\n| Themes | 1 |',
+        6,
+        true,
+      ],
+      [
+        'pending update heading with notes beside category counts',
+        'You manage 10 sites.\n\n**Pending updates**\n\n| Type | Count | Where |\n|---|---|---|\n' +
+          '| Core | 1 | site5 |\n| Plugins | 3 | site4 |\n| Themes | 2 | site6 |\n' +
+          '| Translations | 0 | none |',
+        6,
+        true,
+      ],
+      [
+        'pending header above category counts',
+        'You manage 10 sites.\n\n' +
+          categoryBreakdown.replace('| Type | Count |', '| Type | Pending |'),
+        6,
+        true,
+      ],
+      [
+        'pending updates header above category counts',
+        'You manage 10 sites.\n\n' +
+          categoryBreakdown.replace('| Type | Count |', '| Type | Pending updates |'),
+        6,
+        true,
+      ],
+      [
+        'category counts without a header',
+        'You manage 10 sites.\n\n| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |',
+        6,
+        true,
+      ],
+      [
+        'matching contextual prose count beside a different category sum',
+        'You manage 10 sites.\n\nThere are 6 pending updates.\n\n' +
+          categoryBreakdown.replace('| Themes | 2 |', '| Themes | 1 |'),
+        6,
+        true,
+      ],
+      [
+        'matching explicit prose total beside a different category sum',
+        'You manage 10 sites.\n\nThere are 5 pending updates in total.\n\n' + categoryBreakdown,
+        5,
+        true,
+      ],
+      [
+        'translations outside the credited category table',
+        'You manage 10 sites. There are 7 pending updates in total.\n\n' +
+          categoryBreakdown +
+          '\n\nTranslations: 1 pending update.',
+        7,
+        true,
+      ],
+      [
+        'installed inventory cannot contradict the pending update total',
+        'You manage 10 sites.\n\nThere are 6 pending updates across the network.\n\n' +
+          '**Installed inventory**\n\n| Type | Count |\n|---|---|\n' +
+          '| Core | 10 |\n| Plugins | 120 |\n| Themes | 30 |',
+        6,
+        true,
+      ],
+      [
+        'contextual prose count with an ignored category sum',
+        'You manage 10 sites.\n\nThere are 6 pending updates.\n\n' +
+          categoryBreakdown.replace('| Themes | 2 |', '| Themes | 1 |'),
+        6,
+        true,
+      ],
+      [
+        'matching explicit prose total decides over the category sum',
+        'You manage 10 sites.\n\nThere are 5 pending updates in total.\n\n' + categoryBreakdown,
+        5,
+        true,
+      ],
+      [
+        'conflicting explicit prose total decides over the category sum',
+        'You manage 10 sites.\n\nThere are 5 pending updates in total.\n\n' + categoryBreakdown,
+        6,
+        false,
+      ],
+      [
+        'matching category sum earns credit',
+        'You manage 10 sites.\n\n' + categoryBreakdown,
+        6,
+        true,
+      ],
+      [
+        'different category sum earns no credit',
+        'You manage 10 sites.\n\n' + categoryBreakdown,
+        5,
+        false,
+      ],
+      [
+        'zero category sum earns credit',
+        'You manage 10 sites.\n\n| Type | Count |\n|---|---|\n' +
+          '| Core | 0 |\n| Plugins | 0 |\n| Themes | 0 |',
+        0,
+        true,
+      ],
+    ])(
+      'reads the total from all required update categories: %s',
+      (_name, answer, total, expected) => {
+        expect(
+          matchesNetworkSummaryAnswer(answer, { siteTotals: [10], updateTotals: [total] })
+        ).toBe(expected);
+      }
+    );
+
+    const siteBreakdown = (hostname: string, plugins: number, themes: number) =>
+      `${hostname}:\n| Type | Count |\n|---|---|\n| Plugins | ${plugins} |\n` +
+      `| Themes | ${themes} |\n| Total | ${plugins + themes} |`;
+
+    it.each([
+      [
+        'one site beside the network total',
+        'Sites: 10. Pending updates: 6 in total.\n\n' + siteBreakdown('site4.example.test', 3, 0),
+        6,
+        true,
+      ],
+      [
+        'one site read as the network total',
+        'Sites: 10.\n\n' + siteBreakdown('site4.example.test', 3, 0),
+        3,
+        false,
+      ],
+      [
+        'two sites without a network table',
+        'Sites: 10. Pending updates: 6.\n\n' +
+          siteBreakdown('site4.example.test', 3, 0) +
+          '\n\n' +
+          siteBreakdown('site6.example.test', 0, 3),
+        6,
+        true,
+      ],
+    ])(
+      'does not read a per-site type breakdown as the network total: %s',
+      (_name, answer, total, expected) => {
+        expect(
+          matchesNetworkSummaryAnswer(answer, { siteTotals: [10], updateTotals: [total] })
+        ).toBe(expected);
+      }
+    );
+
+    it.each([
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n' + siteBreakdown('site4.example.test', 3, 0),
+        6,
+        true,
+      ],
+      ['Sites: 10. Pending updates: 6 in total.\n\n' + siteBreakdown('site4', 3, 0), 6, true],
+      ['Sites: 10.\n\n' + siteBreakdown('site4.example.test', 3, 0), 3, false],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n' +
+          siteBreakdown('Network updates (including site4.example.test)', 3, 0),
+        6,
+        false,
+      ],
+      [
+        'Sites: 10.\n\n' +
+          siteBreakdown(
+            '**Pending updates** across site4.example.test and site6.example.test',
+            3,
+            3
+          ),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n1. ' +
+          siteBreakdown('site4.example.test', 3, 0).replace(':\n', '\n'),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n- ' +
+          siteBreakdown('site4.example.test', 3, 0).replace(':\n', '\n'),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n### 1. ' +
+          siteBreakdown('site4.example.test', 3, 0).replace(':\n', '\n'),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n## 1. ' +
+          siteBreakdown('site4', 3, 0).replace(':\n', '\n'),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n### - ' +
+          siteBreakdown('site4.example.test', 3, 0),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n' +
+          siteBreakdown('### site4 — 3 updates', 3, 0).replace(':\n', '\n'),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n' +
+          siteBreakdown('**site4** (health 87)', 3, 0).replace(':\n', '\n'),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n' +
+          siteBreakdown('site4.example.test (3 updates)', 3, 0),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n' +
+          siteBreakdown('### 1. site4.example.test ###', 3, 0).replace(':\n', '\n'),
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n## Pending updates (6)\n' +
+          '| Type | Count |\n|---|---|\n| Core | 1 |\n| Plugins | 3 |\n| Themes | 2 |\n| Total | 6 |',
+        6,
+        true,
+      ],
+      [
+        'Sites: 10. Pending updates: 6 in total.\n\n' +
+          siteBreakdown('Network updates (including site4.example.test)', 3, 0),
+        6,
+        false,
+      ],
+    ])('scopes breakdown totals by a single site heading: %s', (answer, total, expected) => {
+      expect(matchesNetworkSummaryAnswer(answer, { siteTotals: [10], updateTotals: [total] })).toBe(
+        expected
+      );
+    });
+  });
+
+  describe('network-summary grading', () => {
+    const scenario = agentScenarios.find(candidate => candidate.id === 'command-network-summary');
+    const hostnames = ['one.example.test', 'two.example.test'];
+    const grade = async (
+      finalText: string,
+      extraFamily?: string,
+      disconnectedHostnames: string[] = []
+    ) => {
+      if (!scenario?.evaluate) throw new Error('The network-summary scenario lost its evaluator');
+      const sites = hostnames.map((hostname, index) => ({
+        id: index + 1,
+        url: `https://${hostname}`,
+        name: hostname,
+        status: disconnectedHostnames.includes(hostname) ? 'disconnected' : 'connected',
+      }));
+      const verifier = {
+        listSites: async () => sites,
+        listUpdates: async () => ({ total: 0 }),
+      } as unknown as IndependentVerifier;
+      const toolUses = [
+        { id: 'count', name: 'mcp__mainwp__count_sites_v1', input: {} },
+        { id: 'updates', name: 'mcp__mainwp__list_updates_v1', input: {} },
+        ...(extraFamily ? [{ id: 'extra', name: `mcp__mainwp__${extraFamily}`, input: {} }] : []),
+      ];
+      return (
+        await scenario.evaluate(
+          {
+            count: sites.length,
+            allSiteUrls: sites.map(site => site.url),
+            disconnectedSiteUrls: disconnectedHostnames.map(hostname => `https://${hostname}`),
+            updateTotal: 0,
+          },
+          {
+            toolUses,
+            toolResults: [
+              { toolUseId: 'count', content: '{"total":2}' },
+              { toolUseId: 'updates', content: '{"total":0}' },
+              ...(extraFamily ? [{ toolUseId: 'extra', content: '{}' }] : []),
+            ],
+            finalText,
+            totalToolUses: toolUses.length,
+            turns: toolUses.length,
+            resourceReads: [],
+            skill: { discovered: false, invoked: false },
+            assistantText: true,
+          },
+          verifier
+        )
+      ).evaluation;
+    };
+
+    it('accepts the full summary with the update total in a breakdown table', async () => {
+      if (!scenario?.evaluate) throw new Error('The network-summary scenario lost its evaluator');
+      const sites = Array.from({ length: 10 }, (_, index) => ({
+        id: index + 1,
+        url: `https://site${index + 1}.example.test`,
+        name: `site${index + 1}.example.test`,
+        status: 'connected',
+      }));
+      const verifier = {
+        listSites: async () => sites,
+        listUpdates: async () => ({ total: 6 }),
+      } as unknown as IndependentVerifier;
+      const toolUses = [
+        { id: 'count', name: 'mcp__mainwp__count_sites_v1', input: {} },
+        { id: 'updates', name: 'mcp__mainwp__list_updates_v1', input: {} },
+      ];
+      const grade = async (finalText: string) =>
+        (
+          await scenario.evaluate!(
+            {
+              count: sites.length,
+              allSiteUrls: sites.map(site => site.url).sort(),
+              disconnectedSiteUrls: [],
+              updateTotal: 6,
+            },
+            {
+              toolUses,
+              toolResults: [
+                { toolUseId: 'count', content: '{"total":10}' },
+                { toolUseId: 'updates', content: '{"total":6}' },
+              ],
+              finalText,
+              totalToolUses: toolUses.length,
+              turns: toolUses.length,
+              resourceReads: [],
+              skill: { discovered: false, invoked: false },
+              assistantText: true,
+            },
+            verifier
+          )
+        ).evaluation;
+      const evaluation = await grade(FULLY_CONNECTED_NETWORK_SUMMARY);
+
+      expect(evaluation.faithfulFinalAnswer.pass).toBe(true);
+    });
+
+    it('accepts the full summary with all update categories and no total row', async () => {
+      if (!scenario?.evaluate) throw new Error('The network-summary scenario lost its evaluator');
+      const sites = Array.from({ length: 10 }, (_, index) => ({
+        id: index + 1,
+        url: `https://site${index + 1}.example.test`,
+        name: `site${index + 1}.example.test`,
+        status: 'connected',
+      }));
+      const verifier = {
+        listSites: async () => sites,
+        listUpdates: async () => ({ total: 6 }),
+      } as unknown as IndependentVerifier;
+      const toolUses = [
+        { id: 'count', name: 'mcp__mainwp__count_sites_v1', input: {} },
+        { id: 'updates', name: 'mcp__mainwp__list_updates_v1', input: {} },
+      ];
+      const grade = async (finalText: string) =>
+        (
+          await scenario.evaluate!(
+            {
+              count: sites.length,
+              allSiteUrls: sites.map(site => site.url).sort(),
+              disconnectedSiteUrls: [],
+              updateTotal: 6,
+            },
+            {
+              toolUses,
+              toolResults: [
+                { toolUseId: 'count', content: '{"total":10}' },
+                { toolUseId: 'updates', content: '{"total":6}' },
+              ],
+              finalText,
+              totalToolUses: toolUses.length,
+              turns: toolUses.length,
+              resourceReads: [],
+              skill: { discovered: false, invoked: false },
+              assistantText: true,
+            },
+            verifier
+          )
+        ).evaluation;
+      const evaluation = await grade(CATEGORY_ONLY_NETWORK_SUMMARY);
+
+      expect(evaluation.faithfulFinalAnswer.pass).toBe(true);
+    });
+
+    it('allows a network snapshot alongside the inventory reads', async () => {
+      const evaluation = await grade(
+        'You manage 2 sites with 0 pending updates. No sites are disconnected.',
+        'get_network_snapshot_v1'
+      );
+
+      expect(evaluation.stateChange.pass).toBe(true);
+    });
+
+    it.each(['run_updates_v1', 'delete_site_v1', 'unknown_ability_v1'])(
+      'rejects a command call outside the read families: %s',
+      async family => {
+        const evaluation = await grade(
+          'You manage 2 sites with 0 pending updates. No sites are disconnected.',
+          family
+        );
+
+        expect(evaluation.stateChange.pass).toBe(false);
+      }
+    );
+
+    it('accepts empty disconnected and erroring rows in a network summary', async () => {
+      const evaluation = await grade(
+        'You manage 2 sites with 0 pending updates.\n' +
+          '| State | Count | Sites |\n' +
+          '|---|---|---|\n' +
+          '| Connected | 2 | one.example.test, two.example.test |\n' +
+          '| Disconnected | 0 | none |\n' +
+          '| Erroring | 0 | none (the inventory returned no errors) |'
+      );
+
+      expect(evaluation.faithfulFinalAnswer.pass).toBe(true);
+    });
+
+    it.each([
+      '| Disconnected | 1 | one.example.test |',
+      '| Disconnected | 0 | one.example.test |',
+      '| Erroring | 1 | two.example.test |',
+      '| Erroring | 0 | none (two.example.test is offline) |',
+      'one.example.test is not connected.',
+    ])('rejects a disconnected site claim in a healthy network: %s', async claim => {
+      const evaluation = await grade('You manage 2 sites with 0 pending updates.\n' + claim);
+
+      expect(evaluation.faithfulFinalAnswer.pass).toBe(false);
+    });
+
+    it('requires every disconnected site even when an empty row is present', async () => {
+      const evaluation = await grade(
+        'You manage 2 sites with 0 pending updates.\n' +
+          '| Disconnected | 1 | one.example.test |\n' +
+          '| Erroring | 0 | none |',
+        undefined,
+        hostnames
+      );
+
+      expect(evaluation.faithfulFinalAnswer.pass).toBe(false);
+    });
+  });
+
   it('marks the network summary unverified when the roster changes mid-run', async () => {
     const scenario = agentScenarios.find(candidate => candidate.id === 'command-network-summary');
     if (!scenario?.evaluate) throw new Error('The network-summary scenario lost its evaluator');
@@ -3325,6 +4421,29 @@ describe('plugin command scenarios', () => {
     ).toBe(true);
   });
 
+  it('ignores a category sum when checking site update conflicts', () => {
+    const answer = '| Type | Count |\n|---|---|\n| Core | 0 |\n| Plugins | 3 |\n| Themes | 1 |';
+
+    expect(statedUpdateTotalConflicts(answer, 5)).toBe(false);
+    expect(statedUpdateTotalConflicts(answer, 4)).toBe(false);
+  });
+
+  it('keeps a total row as a stated site update total', () => {
+    const answer =
+      '| Type | Count |\n|---|---|\n| Core | 0 |\n| Plugins | 3 |\n| Themes | 1 |\n| Total | 4 |';
+
+    expect(statedUpdateTotalConflicts(answer, 5)).toBe(true);
+    expect(statedUpdateTotalConflicts(answer, 4)).toBe(false);
+  });
+
+  it('ignores an installed total when checking site update conflicts', () => {
+    const answer =
+      'There are 6 pending updates.\n\n| Type | Installed |\n|---|---|\n' +
+      '| Core | 10 |\n| Plugins | 120 |\n| Themes | 30 |\n| Total | 160 |';
+
+    expect(statedUpdateTotalConflicts(answer, 6)).toBe(false);
+  });
+
   it('reads numbered update items as list numbering, not as a count', () => {
     // "Update 1:" and "Update 2:" number the items they introduce. The report
     // states no total at all, so it cannot state a conflicting one.
@@ -3386,6 +4505,749 @@ describe('plugin command scenarios', () => {
     expect(claimsNoPendingUpdates('No pending updates anywhere.')).toBe(true);
     expect(claimsNoPendingUpdates('7 pending updates are waiting on this site.')).toBe(false);
     expect(claimsNoPendingUpdates('This site is not up to date.')).toBe(false);
+  });
+
+  it.each([
+    '| Erroring | 0 found | none |',
+    'So "erroring" means only that no site came back with a non-connected status.',
+    'Erroring: n/a (the Dashboard has no error field)',
+    'If a site goes offline, run a reconnect.',
+    '0 of 10 sites are disconnected.',
+    '0/10 sites are disconnected.',
+    'cedar.example.test is connected but the offline category is empty.',
+    'I checked 10 sites for disconnected status and found none.',
+    'All 4 sites are connected, no outages. 0 disconnected.',
+    'Sites: 4. Connected: 4. Disconnected: 0.',
+    'No sites are disconnected or down.',
+    'All 3 sites are connected. Disconnected sites (0).',
+    "Cedar.example.test isn't offline; it is connected.",
+    'Cedar.example.test is never offline.',
+    'All 3 sites are connected, none erroring.',
+    'All sites are connected. If a site is not responding, run a reconnect.',
+    'Apart from a sync warning on alpine.example.test, all sites are connected.',
+    '| Disconnected | 0 | none |',
+    '| Erroring | 0 | none (the inventory returned no errors) |',
+  ])('accepts an empty disconnected oracle without a down assertion: %s', answer => {
+    expect(
+      answerLabelsDisconnectedSites(answer, [], ['cedar.example.test', 'alpine.example.test'])
+    ).toBe(true);
+  });
+
+  it('accepts the full summary of a fully connected network', () => {
+    const hostnames = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+    expect(answerLabelsDisconnectedSites(FULLY_CONNECTED_NETWORK_SUMMARY, [], hostnames)).toBe(
+      true
+    );
+  });
+
+  it.each([
+    'You manage 4 sites, 2 sites are down.',
+    'One site is no longer connected.',
+    'cedar.example.test is not responding.',
+    'one.example.test is not connected.',
+    '| Disconnected | 1 | one.example.test |',
+    '| Erroring | 1 | two.example.test |',
+    '| Disconnected | 0 | one.example.test |',
+    '| Erroring | 0 | none (two.example.test is offline) |',
+    'site5 is offline.',
+    'staging.other.test is unreachable.',
+    '| Disconnected | 3 | |',
+    'Some sites are offline.',
+    'Sites are offline.',
+    'At least 2 disconnected sites need attention.',
+    'Disconnected:\n- cedar.example.test',
+    'cedar.example.test is offline and should be reconnected.',
+    'cedar.example.test was offline when last checked.',
+    'No updates but one site is not responding.',
+    'No updates but one site is offline.',
+  ])('rejects a linked down assertion against an empty oracle: %s', answer => {
+    expect(
+      answerLabelsDisconnectedSites(
+        answer,
+        [],
+        ['one.example.test', 'two.example.test', 'cedar.example.test', 'site5.example.test']
+      )
+    ).toBe(false);
+  });
+
+  it.each([
+    '| Disconnected | 0 | none |',
+    '| Site | Status |',
+    '### Disconnected sites (0)',
+    '### Disconnected sites\nNone.',
+    'None of the 10 sites are offline.',
+    'None of the sites are disconnected.',
+    'None of 10 sites are offline.',
+    'Neither of the 10 sites are offline.',
+    'Neither of the sites are disconnected.',
+    'Neither of 10 sites are offline.',
+    '**Disconnected sites:** none',
+    '**Disconnected / erroring sites:** none',
+    'Disconnected sites would appear here; there are none.',
+    '| Erroring | 0 | none (PHP 8.1 inventory returned no errors) |',
+  ])('accepts healthy site labels and negated quantities: %s', answer => {
+    const hostnames = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+    expect(answerLabelsDisconnectedSites(answer, [], hostnames)).toBe(true);
+  });
+
+  it.each([
+    '| site3.example.test | Disconnected |',
+    '| Site | Status |\n| site3.example.test | Offline |',
+    '## Disconnected\n- site3.example.test',
+    '## Disconnected\n\n- site3.example.test',
+    'site3.example.test: disconnected',
+    'site3.example.test (offline)',
+    'site3.example.test — disconnected',
+    '| Disconnected | 0 | one.example.test |',
+    'Sites are offline.',
+    'Disconnected sites: 2',
+    'There are 2 disconnected sites.',
+    'Disconnected sites (2): site3.example.test, site4.example.test',
+    'staging.other.test is unreachable.',
+    'site3.example.test is currently offline.',
+    'site3.example.test is still not responding.',
+    'site3.example.test has been offline since Monday.',
+    '2 sites are currently down.',
+    'site3.example.test is now disconnected.',
+    '| site3.example.test | Currently offline |',
+    'site3.example.test is unfortunately completely offline.',
+    'Some sites are sadly unreachable.',
+    'Currently offline: site3.example.test',
+    'site3 is still offline.',
+    'One site is currently unreachable.',
+  ])('rejects named sites under down labels and positive quantities: %s', answer => {
+    const hostnames = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+    expect(answerLabelsDisconnectedSites(answer, [], hostnames)).toBe(false);
+  });
+
+  it.each([
+    '**Disconnected / erroring:**\n- site3.example.test',
+    '## Disconnected / erroring\n- site3.example.test',
+    '| Disconnected / erroring | 1 | site3.example.test |',
+    '| Disconnected or erroring | 2 | |',
+    'site3.example.test is listed as disconnected.',
+    'site3.example.test is marked as offline.',
+  ])('rejects combined down labels and listed-as links: %s', answer => {
+    const hostnames = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+    expect(answerLabelsDisconnectedSites(answer, [], hostnames)).toBe(false);
+  });
+
+  it.each([
+    '| Disconnected / erroring | 0 | none |',
+    '**Disconnected / erroring:** none',
+    'Erroring (i.e. a non-connected status): none',
+    'Offline (e.g. unreachable): none',
+  ])('accepts combined empty labels and abbreviations: %s', answer => {
+    const hostnames = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+    expect(answerLabelsDisconnectedSites(answer, [], hostnames)).toBe(true);
+  });
+
+  it.each([
+    'If you want me to reconnect them, site3.example.test and site4.example.test are offline.',
+    'Let me know if you want details: site3.example.test is offline.',
+    'Offline: https://site3.example.test',
+    'site3.example.test/ is offline.',
+    'Disconnected: https://site3.example.test/',
+    'https://site3.example.test is offline.',
+    '| Disconnected | 1 | https://site3.example.test |',
+  ])('rejects down claims after separate hypotheticals and with site URLs: %s', answer => {
+    const hostnames = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+    expect(answerLabelsDisconnectedSites(answer, [], hostnames)).toBe(false);
+  });
+
+  it.each([
+    'If a site goes offline, run a reconnect.',
+    'All sites are connected. If a site is not responding, run a reconnect.',
+    'If site3.example.test goes offline, reconnect it.',
+    'Disconnected: none (see https://site3.example.test/wp-admin for details)',
+    'All 10 sites are connected, including https://site3.example.test/.',
+  ])('accepts scoped hypothetical down claims and healthy site URLs: %s', answer => {
+    const hostnames = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+    expect(answerLabelsDisconnectedSites(answer, [], hostnames)).toBe(true);
+  });
+
+  const connectedRoster = Array.from({ length: 10 }, (_, index) => `site${index + 1}.example.test`);
+
+  it.each([
+    ['Offline: https://site3.example.test', connectedRoster, false],
+    ['Disconnected: https://site3.example.test/', connectedRoster, false],
+    ['site3.example.test/ is offline.', connectedRoster, false],
+    ['https://site3.example.test/wp-admin is offline.', connectedRoster, false],
+    ['Disconnected: [site3.example.test](https://site3.example.test)', connectedRoster, false],
+    ['[site3.example.test](https://site3.example.test) is offline.', connectedRoster, false],
+    ['<https://site3.example.test> is offline.', connectedRoster, false],
+    [
+      'All sites are connected. See https://site3.example.test/offline for documentation.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'Disconnected: none (see https://site3.example.test/wp-admin for details)',
+      connectedRoster,
+      true,
+    ],
+    ['All 10 sites are connected, including https://site3.example.test/.', connectedRoster, true],
+    ['site3.example.t is offline.', ['site3.example.t'], false],
+    ['Erroring (i.e. a non-connected status): none', connectedRoster, true],
+    ['[site3.example.test admin](https://site3.example.test) is offline.', connectedRoster, false],
+    ['No site is offline.', ['site.example.test'], true],
+    ['site.example.test is offline.', ['site.example.test'], false],
+    ['No sites are offline.', ['sites.example.test'], true],
+    ['sites.example.test is offline.', ['sites.example.test'], false],
+    ['No website is offline.', ['website.example.test'], true],
+    ['website.example.test is offline.', ['website.example.test'], false],
+    ['No websites are offline.', ['websites.example.test'], true],
+    ['websites.example.test is offline.', ['websites.example.test'], false],
+    [
+      'cedar.example.test is connected but the offline category is empty.',
+      [...connectedRoster, 'cedar.example.test'],
+      true,
+    ],
+    [
+      "cedar.example.test isn't offline; it is connected.",
+      [...connectedRoster, 'cedar.example.test'],
+      true,
+    ],
+    ['cedar.example.test is never offline.', [...connectedRoster, 'cedar.example.test'], true],
+    ['site3.example.test is online, none offline.', connectedRoster, true],
+    ['site3.example.test is up and no site is down.', connectedRoster, true],
+    ['All 10 sites are currently connected.', connectedRoster, true],
+    ['No site is currently offline.', connectedRoster, true],
+    ['None of the sites are currently down.', connectedRoster, true],
+    ['site3.example.test is not currently offline.', connectedRoster, true],
+    ['site3.example.test is back online and nothing is offline.', connectedRoster, true],
+    [
+      'site5.example.test is the only site with a core update; no site is offline.',
+      connectedRoster,
+      true,
+    ],
+  ])(
+    'canonicalizes site mentions for an empty disconnected oracle: %s',
+    (answer, roster, expected) => {
+      expect(answerLabelsDisconnectedSites(answer, [], roster)).toBe(expected);
+    }
+  );
+
+  it.each<[string, boolean, string[]?]>([
+    ['If a site goes offline, run a reconnect.', true],
+    ['If site3.example.test goes offline, reconnect it.', true],
+    ['If https://site3.example.test and site4.example.test are offline, reconnect them.', true],
+    ['If, after a sync, a site is not responding, run a reconnect.', true],
+    ['Unless, of course, a site is not responding.', true],
+    ['In case, after the next sync, a site is offline, reconnect it.', true],
+    [
+      'If you want me to reconnect them, site3.example.test and site4.example.test are offline.',
+      false,
+    ],
+    ['Let me know if you want details: site3.example.test is offline.', false],
+    ['If you want details, site3.example.test is offline.', false],
+    ['When a site is not responding, run a reconnect.', true],
+    ['All sites are connected. When a site is not responding, run a reconnect.', true],
+    ['Once a site is no longer connected, reconnect it from the dashboard.', true],
+    ['Should a site not respond, reconnect it.', true],
+    ['When a site is offline, run a reconnect.', true],
+    ["You'll be alerted when sites are offline.", true],
+    ['**If**, after a sync, a site is not responding, run a reconnect.', true],
+    [
+      'cedar.example.test was offline when last checked.',
+      false,
+      [...connectedRoster, 'cedar.example.test'],
+    ],
+    [
+      'cedar.example.test is offline and should be reconnected.',
+      false,
+      [...connectedRoster, 'cedar.example.test'],
+    ],
+    ['- Once a site is disconnected, it shows in red.', true],
+    ['- Once 2 sites are offline, the alert fires.', true],
+    ['> Once a site is disconnected, it shows in red.', true],
+    ['All 10 sites are connected.\n- Should you find a site not responding, reconnect it.', true],
+    ['1. Once a site is disconnected, it shows in red.', true],
+    ['- Once again site3.example.test is offline.', false],
+    ['- You should know that 2 sites are offline.', false],
+    ['When I checked, 2 sites were offline.', false],
+    ['When last checked, site3.example.test was not responding.', false],
+    ['site3.example.test is not responding when pinged.', false],
+    ['Whenever a site is offline, run a reconnect.', true],
+    ['You should know that 2 sites are offline.', false],
+    ['I should mention site3.example.test is offline.', false],
+    ['Once again site3.example.test is offline.', false],
+    ['Once more, 2 sites are offline.', false],
+    ['Should a site not respond, reconnect it.', true],
+    ['Once a site is no longer connected, reconnect it from the dashboard.', true],
+    ['All sites are connected. Should a site stop responding, run a reconnect.', true],
+    ['When a site is not responding, run a reconnect.', true],
+    [
+      'cedar.example.test is offline and should be reconnected.',
+      false,
+      [...connectedRoster, 'cedar.example.test'],
+    ],
+  ])('scopes hypothetical down claims to the subject clause: %s', (answer, expected, roster) => {
+    if (roster) {
+      expect(answerLabelsDisconnectedSites(answer, [], roster)).toBe(expected);
+      return;
+    }
+    expect(answerLabelsDisconnectedSites(answer, [], connectedRoster)).toBe(expected);
+  });
+
+  it.each([
+    ['Disconnected:\n- cedar.example.test', [...connectedRoster, 'cedar.example.test'], false],
+    ['## Disconnected\n\n- site3.example.test', connectedRoster, false],
+    ['**Disconnected / erroring:**\n- site3.example.test', connectedRoster, false],
+    [
+      'Disconnected:\n- none\n\n**Sync freshness**\n- site1.example.test synced at 01:28 UTC',
+      connectedRoster,
+      true,
+    ],
+    [
+      '### Disconnected sites\nNone.\n\n**Fully current**\n- site1.example.test',
+      connectedRoster,
+      true,
+    ],
+    [
+      '### Disconnected sites\nNone.\n\n| Site | Last sync |\n|---|---|\n| site1.example.test | 01:28 |',
+      connectedRoster,
+      true,
+    ],
+    [
+      '**Disconnected:**\n- none\n\n**Needs attention now**\n1. **site5**: WordPress core 6.8.3 → 7.1.2',
+      connectedRoster,
+      true,
+    ],
+    [
+      '## Network summary\n\n### Disconnected sites\nNone.\n\n### Erroring sites\nNone.\n\n' +
+        '**Needs attention now**\n1. **site5**: WordPress core is a major version behind.',
+      connectedRoster,
+      true,
+    ],
+    ['| site3.example.test | 🔴 Disconnected |', connectedRoster, false],
+    ['| ❌ Disconnected | 2 | |', connectedRoster, false],
+    ['## 🔴 Disconnected\n- site3.example.test', connectedRoster, false],
+    ['**🔴 Disconnected:**\n- site3.example.test', connectedRoster, false],
+    ['site3.example.test is 🔴 offline.', connectedRoster, false],
+    [
+      '| ✅ Connected | 10 | site1 to site10 |\n| 🔴 Disconnected | 0 | none |',
+      connectedRoster,
+      true,
+    ],
+    ['Sites offline:\n- None', connectedRoster, true],
+    ['Sites offline:\nNone.', connectedRoster, true],
+    ['Sites disconnected:\n- none', connectedRoster, true],
+    ['Sites offline:\n0', connectedRoster, true],
+    ['### Sites offline\nNone.', connectedRoster, true],
+    ['## Sites down\n- none', connectedRoster, true],
+    ['Sites offline: 2', connectedRoster, false],
+    ['Sites offline:\n- site3.example.test', connectedRoster, false],
+    ['### Sites offline (2)', connectedRoster, false],
+    ['Sites are offline.', connectedRoster, false],
+    ['Disconnected:\n- site3.example.test.', connectedRoster, false],
+    ['Disconnected:\n1. site3.example.test.', connectedRoster, false],
+    ['Disconnected:\n\nsite3.example.test.', connectedRoster, false],
+    [
+      'Disconnected:\n- site3.example.test is connected; site4.example.test',
+      connectedRoster,
+      false,
+    ],
+    ['Disconnected:\n- site3.example.test: child plugin not responding', connectedRoster, false],
+    ['Disconnected:\n- site3.example.test, unreachable', connectedRoster, false],
+    [
+      '## Disconnected\n- site3.example.test - last sync failed, not reachable',
+      connectedRoster,
+      false,
+    ],
+    ['Disconnected:\n- site3.example.test is connected', connectedRoster, true],
+    ['Disconnected:\n**site3**\n- site4.example.test', connectedRoster, true],
+    ['Sites offline.', connectedRoster, false],
+    ['Sites down.', connectedRoster, false],
+    ['Websites offline!', connectedRoster, false],
+    ['**Sites offline**', connectedRoster, false],
+    ['Sites offline:\n- None', connectedRoster, true],
+    ['### Sites offline\nNone.', connectedRoster, true],
+    ['Sites offline: 2', connectedRoster, false],
+    ['Disconnected sites: none found.', connectedRoster, true],
+    ['Sites offline\n- None', connectedRoster, true],
+    ['Sites offline\nNone', connectedRoster, true],
+    ['Sites offline\n0', connectedRoster, true],
+    ['Sites offline\n- site3.example.test', connectedRoster, false],
+    ['Sites offline', connectedRoster, false],
+    ['Sites offline.', connectedRoster, false],
+    ['**Sites offline**', connectedRoster, false],
+    ['| Sites offline | 0 |', connectedRoster, true],
+    ['| Sites offline | none |', connectedRoster, true],
+    ['| Sites down | 0 | — |', connectedRoster, true],
+    ['| Sites offline | 2 |', connectedRoster, false],
+    ['| Sites offline | site3.example.test |', connectedRoster, false],
+    ['| Sites are offline | 0 |', connectedRoster, false],
+
+    // Only adverb qualifiers preserve a connection claim through intervening words.
+    [
+      'site3.example.test is using Offline Mode version 2.1; all sites are connected.',
+      connectedRoster,
+      true,
+    ],
+    ['site3.example.test is showing the offline category as empty.', connectedRoster, true],
+    [
+      'site3.example.test is in the offline category documentation example; its actual status is connected.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'site3.example.test is awaiting an offline backup; it remains connected.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'site3.example.test is ready for offline maintenance; it remains connected.',
+      connectedRoster,
+      true,
+    ],
+    ['site3.example.test: the offline category is empty.', connectedRoster, true],
+    [
+      'site3.example.test: an offline backup is recommended before upgrading.',
+      connectedRoster,
+      true,
+    ],
+    ['2 sites are showing the offline category as empty.', connectedRoster, true],
+    ['2 sites are due for offline backups; both remain connected.', connectedRoster, true],
+    [
+      'All 10 sites are connected. site3.example.test is safe from offline failures.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is flagged for offline testing only.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is on the offline backup schedule.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is running Offline Mode 2.1.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is using an offline cache.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test has been updated offline using a backup copy.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is keeping offline backups.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. 2 sites have been updated offline using backup copies.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is scheduled for offline maintenance tomorrow.',
+      connectedRoster,
+      true,
+    ],
+    ['All 10 sites are connected. site3.example.test is far from offline.', connectedRoster, true],
+    [
+      'All 10 sites are connected. site3.example.test is anything except offline.',
+      connectedRoster,
+      true,
+    ],
+    ['All 10 sites are connected. 2 sites are nowhere near offline.', connectedRoster, true],
+    [
+      'All 10 sites are connected. site3.example.test is unlikely to go offline.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is unlikely to be offline.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is nowhere near offline.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test is anything other than offline.',
+      connectedRoster,
+      true,
+    ],
+    ['All 10 sites are connected. 2 sites are far from offline.', connectedRoster, true],
+    ['site3.example.test has recently been offline.', connectedRoster, false],
+    ['2 sites have recently been offline.', connectedRoster, false],
+    ['site3.example.test had already been offline.', connectedRoster, false],
+    ['site3.example.test has unfortunately been disconnected.', connectedRoster, false],
+    ['Several sites currently offline.', connectedRoster, false],
+    ['Three sites currently unreachable.', connectedRoster, false],
+    ['Cedar currently offline.', [...connectedRoster, 'cedar.example.test'], false],
+    ['site3.example.test is one major version down.', connectedRoster, true],
+    ['Erroring would mean a site is in an error state; none are.', connectedRoster, true],
+    ['All 10 sites were checked for offline status.', connectedRoster, true],
+    ['Every site is checked for offline status on each sync.', connectedRoster, true],
+    [
+      'All 10 sites were checked for offline or erroring states, and every one is connected.',
+      connectedRoster,
+      true,
+    ],
+    ['All 10 sites are free of any offline status.', connectedRoster, true],
+    ['10 sites are without any offline flag.', connectedRoster, true],
+    ['site3.example.test is far from offline.', connectedRoster, true],
+    ['site3.example.test is fine rather than offline.', connectedRoster, true],
+    ['site3.example.test is back after being offline yesterday.', connectedRoster, true],
+    ['site3.example.test is reconnected after being offline last week.', connectedRoster, true],
+    [
+      'site3.example.test is likely to go offline briefly during the core update.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'site3.example.test is expected to go offline briefly during the core update.',
+      connectedRoster,
+      true,
+    ],
+    ['Two sites are scheduled to go offline for maintenance tonight.', connectedRoster, true],
+    ['Two sites still show as disconnected.', connectedRoster, false],
+    ['site3.example.test still shows as disconnected.', connectedRoster, false],
+    ['site3.example.test currently shows as offline.', connectedRoster, false],
+    ['site3.example.test also appears offline.', connectedRoster, false],
+    ['site3.example.test is being taken down.', connectedRoster, true],
+    ['Two sites have already been offline.', connectedRoster, false],
+    ['site3.example.test is rarely offline.', connectedRoster, true],
+    ['site3.example.test is hardly ever offline.', connectedRoster, true],
+
+    // A score or count can fall without changing the site connection.
+    [
+      'site3.example.test is slightly down from its previous health score of 93 to 87.',
+      connectedRoster,
+      true,
+    ],
+    ['2 sites are slightly down from their previous health scores.', connectedRoster, true],
+    [
+      'All 10 sites are connected. The health score on site3.example.test is slightly down from 93 to 87.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. Pending updates on site3.example.test are now down from 6 to 3.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. Pending updates across 2 sites are now down from 6 to 3.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test: health score slightly down from 93 to 87.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. site3.example.test: plugin updates down from 6 to 3.',
+      connectedRoster,
+      true,
+    ],
+    ['Updates across 3 sites are broken down below:', connectedRoster, true],
+    ['The 10 sites are broken down by status below.', connectedRoster, true],
+    ['Pending updates on 3 sites are broken down by type:', connectedRoster, true],
+    ['Updates for site3.example.test are broken down by type below.', connectedRoster, true],
+    [
+      'The 6 pending updates on site3.example.test have been broken down by type below.',
+      connectedRoster,
+      true,
+    ],
+    ['site3.example.test has been trending down on its health score.', connectedRoster, true],
+    ['2 sites are trending down in health score.', connectedRoster, true],
+    ['site3.example.test is being slowed down by a heavy plugin.', connectedRoster, true],
+    ['site3.example.test is worth drilling down into.', connectedRoster, true],
+    ['site3.example.test is slightly down in health score.', connectedRoster, true],
+    ['Pending updates on site3.example.test are now down from 6 to 3.', connectedRoster, true],
+    ['2 sites are currently down.', connectedRoster, false],
+    ['site3.example.test has been down since Monday.', connectedRoster, false],
+
+    // A conditional definition of a status does not report a current outage.
+    [
+      'A site is only listed as disconnected when the Dashboard loses contact with it.',
+      connectedRoster,
+      true,
+    ],
+    ["A site is only marked disconnected if the Dashboard can't reach it.", connectedRoster, true],
+    ['A site is considered offline when it misses a sync.', connectedRoster, true],
+    ['A site is treated as disconnected when its last sync fails.', connectedRoster, true],
+    [
+      'A site is usually reported as disconnected when the child plugin is deactivated.',
+      connectedRoster,
+      true,
+    ],
+    [
+      'A site is typically marked offline after repeated sync failures. None are.',
+      connectedRoster,
+      true,
+    ],
+    ['A site is offline.', connectedRoster, false],
+    ['One site is currently unreachable.', connectedRoster, false],
+
+    // A label cannot swallow the subject of its own outage claim.
+    ['Two sites offline.', connectedRoster, false],
+    ['Some sites offline.', connectedRoster, false],
+    ['Two offline sites.', connectedRoster, false],
+    ['Three sites unreachable.', connectedRoster, false],
+    ['Both sites down.', connectedRoster, false],
+    ['All sites offline.', connectedRoster, false],
+    ['Eight connected; two sites offline.', connectedRoster, false],
+    ['Cedar offline.', [...connectedRoster, 'cedar.example.test'], false],
+    ['2 sites offline.', connectedRoster, false],
+    ['Sites offline:\n- None', connectedRoster, true],
+    ['### Sites offline\nNone.', connectedRoster, true],
+    ['| Sites offline | 0 |', connectedRoster, true],
+    ['Disconnected sites (0)', connectedRoster, true],
+    ['Disconnected sites: none found.', connectedRoster, true],
+
+    // Negating a connected state labels the same outage as a down word.
+    ['site3.example.test: still not responding', connectedRoster, false],
+    ['site3.example.test — currently no longer connected', connectedRoster, false],
+    ['Currently not responding: site3.example.test', connectedRoster, false],
+    ['Currently no longer connected: site3.example.test', connectedRoster, false],
+    ['Currently not responding: 2 sites', connectedRoster, false],
+    ['Currently no longer connected: 2 sites', connectedRoster, false],
+    ['site3.example.test: currently completely not responding', connectedRoster, false],
+    ['site3.example.test (still not responding)', connectedRoster, false],
+    ['Not responding: site3.example.test', connectedRoster, false],
+    ['site3.example.test — not responding', connectedRoster, false],
+    ['Not responding: none', connectedRoster, true],
+    ['Sites not responding: 0', connectedRoster, true],
+
+    // Inflection and a possessive status noun keep the verdict on the site.
+    ['site3.example.test is showing up as offline.', connectedRoster, false],
+    ['site3.example.test is still showing up as disconnected.', connectedRoster, false],
+    ['Two sites remain offline.', connectedRoster, false],
+    ['2 sites remain disconnected.', connectedRoster, false],
+    ['site3.example.test shows up as disconnected.', connectedRoster, false],
+    ["site3.example.test's status is disconnected.", connectedRoster, false],
+    ["site3.example.test's connection is down.", connectedRoster, false],
+    ['All sites remain connected.', connectedRoster, true],
+    ['site3.example.test now shows as connected.', connectedRoster, true],
+    ["site3.example.test's status is connected.", connectedRoster, true],
+
+    // Label punctuation binds a positive site count while zero remains empty.
+    ['2 sites: currently down', connectedRoster, false],
+    ['2 sites — currently offline', connectedRoster, false],
+    ['0 sites: currently down', connectedRoster, true],
+    ['10 sites: connected, none offline', connectedRoster, true],
+
+    // List markers and separators preserve the label's site or count binding.
+    ['- Disconnected: site3.example.test', connectedRoster, false],
+    ['- **Disconnected:** site3.example.test', connectedRoster, false],
+    ['- Offline: cedar.example.test', [...connectedRoster, 'cedar.example.test'], false],
+    ['- Disconnected (1): site3.example.test', connectedRoster, false],
+    ['- Disconnected: 2', connectedRoster, false],
+    ['- Erroring: site3.example.test', connectedRoster, false],
+    ['- Connected: 9\n- Disconnected: site3.example.test', connectedRoster, false],
+    ['- Offline sites: 2', connectedRoster, false],
+    ['- Offline sites: site3.example.test, site4.example.test', connectedRoster, false],
+    ['- Down: site3.example.test', connectedRoster, false],
+    ['- Unreachable: 1', connectedRoster, false],
+    ['• Disconnected: site3.example.test', connectedRoster, false],
+    ['+ Disconnected: site3.example.test', connectedRoster, false],
+    ['Status - Disconnected: site3.example.test', connectedRoster, false],
+    ['Connected: 9 - Disconnected: 1', connectedRoster, false],
+    ['Connected: 9 · Disconnected: 1 · Erroring: 0', connectedRoster, false],
+    ['- Disconnected: site3.example.test (since Monday)', connectedRoster, false],
+    ['- Disconnected - site3.example.test', connectedRoster, false],
+    ['- Disconnected — site3.example.test', connectedRoster, false],
+    ['- Connected: 10\n- Disconnected: 0\n- Erroring: 0', connectedRoster, true],
+    ['- Disconnected: none', connectedRoster, true],
+    ['- Disconnected: 0', connectedRoster, true],
+    ['Connected: 10 - Disconnected: 0 - Erroring: 0', connectedRoster, true],
+    ['- Erroring: 0. The update inventory returned no per-site errors.', connectedRoster, true],
+    ['- Disconnected: none\n- Erroring: none', connectedRoster, true],
+
+    // A status cell can explain its verdict without making a software name a status.
+    [
+      'All 10 sites are connected. | site3.example.test | Plugin updates down |',
+      connectedRoster,
+      true,
+    ],
+    [
+      'All 10 sites are connected. | Update count down | 2 | site3.example.test |',
+      connectedRoster,
+      true,
+    ],
+    ['| site3.example.test | Currently marked as offline |', connectedRoster, false],
+    ['| site3.example.test | Still listed as offline |', connectedRoster, false],
+    ['| site3.example.test | Currently marked offline |', connectedRoster, false],
+    ['| site3.example.test | Apparently marked as unreachable |', connectedRoster, false],
+    ['| Currently marked as offline | 2 | |', connectedRoster, false],
+    ['| site3.example.test | Currently offline since Monday |', connectedRoster, false],
+    ['| site3.example.test | Currently offline (last checked today) |', connectedRoster, false],
+    ['| Currently offline since Monday | 2 | |', connectedRoster, false],
+    ['| site3.example.test | Currently offline; reconnect required |', connectedRoster, false],
+    ['| site3.example.test | Currently offline, last sync failed |', connectedRoster, false],
+    ['| site3.example.test | Currently offline. Last sync failed. |', connectedRoster, false],
+    ['| site3.example.test | Showing up as offline |', connectedRoster, false],
+    ['| site3.example.test | Currently not responding |', connectedRoster, false],
+    ['| site3.example.test | Offline (since Monday) |', connectedRoster, false],
+    ['| site3.example.test | Connected |', connectedRoster, true],
+    ['| site3.example.test | Offline Mode plugin installed |', connectedRoster, true],
+    ['| Site | Status |', connectedRoster, true],
+  ])('bounds down heading reach and strips label presentation: %s', (answer, roster, expected) => {
+    expect(answerLabelsDisconnectedSites(answer, [], roster)).toBe(expected);
+  });
+
+  it.each([
+    ['None of the 10 managed sites are disconnected.', true],
+    ['Neither of the 10 connected child sites are offline.', true],
+    ['Zero of the 10 active monitored sites are down.', true],
+    ['None of the sites are up to date.', true],
+    ['No sites are up for renewal this month.', true],
+    ['No site is connected over plain HTTP.', true],
+    ['Zero sites are responding slowly.', true],
+    ['2 of the 10 managed sites are disconnected.', false],
+    ['2 of the 10 managed child sites are offline.', false],
+    ['No updates and 2 of the 10 managed sites are disconnected.', false],
+    ['Neither site1.example.test nor site2.example.test is offline.', true],
+    ['Neither site1 nor site2 is offline.', true],
+    ['Neither site1.example.test nor site2.example.test is not connected.', true],
+    [
+      'Neither site1.example.test nor site2.example.test is online; site2.example.test is offline.',
+      false,
+    ],
+    ['None of your connected sites are offline.', true],
+    ['None of the managed sites is down.', true],
+    ['No managed sites are offline.', true],
+    ['No child sites are disconnected.', true],
+    ["There aren't any sites offline.", true],
+    ['Not one of the sites is offline.', true],
+    ['All 10 sites are connected; none of the child sites are offline.', true],
+    ['No WordPress sites are offline.', true],
+    ['Zero managed sites are disconnected.', true],
+    ['0 out of 10 sites are offline.', true],
+    ['No updates but one site is offline.', false],
+    ['No updates but sites are offline.', false],
+    ['No updates and sites are offline.', false],
+    ['2 out of 10 sites are offline.', false],
+    ['At least 2 disconnected sites need attention.', false],
+    ['Not a single one of the sites is offline.', true],
+    ['No updates but sites are offline.', false],
+    ['No updates and sites are offline.', false],
+  ])('cancels negated site quantities without crossing conjunctions: %s', (answer, expected) => {
+    expect(answerLabelsDisconnectedSites(answer, [], connectedRoster)).toBe(expected);
   });
 
   it('grades disconnected sites on being labeled, not merely named', () => {
@@ -3903,7 +5765,7 @@ describe('acceptance fixture catalog', () => {
         (await run('mainwp/get-site-updates-v1', '?input[site_id_or_domain]=2')).updates
       ).toEqual([]);
 
-      const network = await run('mainwp/list-updates-v1');
+      const network = await run('mainwp/list-updates-v1', '?input=');
       expect(network.summary).toEqual({
         core: 1,
         plugins: 2,
@@ -3912,7 +5774,7 @@ describe('acceptance fixture catalog', () => {
         total: 4,
       });
       expect(network.total).toBe(4);
-      expect((await run('mainwp/list-ignored-updates-v1')).total).toBe(2);
+      expect((await run('mainwp/list-ignored-updates-v1', '?input=')).total).toBe(2);
 
       const themes = await run('mainwp/get-site-themes-v1', '?input[site_id_or_domain]=1');
       expect(themes.active_theme).toBe('bakehouse');
@@ -3935,10 +5797,10 @@ describe('acceptance fixture catalog', () => {
         }
       );
       expect(deleted.status).toBe(200);
-      expect((await run('mainwp/list-updates-v1')).total).toBe(2);
+      expect((await run('mainwp/list-updates-v1', '?input=')).total).toBe(2);
       // The inventory travels with the site record, so reset() restores it.
       fixture.reset();
-      expect((await run('mainwp/list-updates-v1')).total).toBe(4);
+      expect((await run('mainwp/list-updates-v1', '?input=')).total).toBe(4);
     } finally {
       await fixture.close();
     }
@@ -3985,7 +5847,9 @@ describe('acceptance fixture catalog', () => {
             'utf8'
           )
         ) as Array<{ name: string }>
-      ).map(ability => ability.name)
+      )
+        .map(ability => ability.name)
+        .concat(makeDashboard63Abilities().map(ability => ability.name))
     );
     for (const name of FIXTURE_ROUTED_ABILITIES) {
       if (name === FIXTURE_CONFIRM_ONLY_ABILITY) continue;
@@ -4134,6 +5998,18 @@ describe('agent launch isolation and failure reasons', () => {
 });
 
 describe('local dependency registry', () => {
+  it('never packs two versions of one name in the same npm pack call', () => {
+    const batches = batchByUniqueName(
+      ['content-type', 'express', 'content-type', 'body-parser', 'content-type'],
+      name => name
+    );
+    expect(batches).toEqual([
+      ['content-type', 'express', 'body-parser'],
+      ['content-type'],
+      ['content-type'],
+    ]);
+  });
+
   it('serves every packed version when a package appears at multiple tree depths', async () => {
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'registry-repo-'));
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'registry-temp-'));
@@ -4187,4 +6063,303 @@ describe('local dependency registry', () => {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
+});
+
+describe('packed consumer install', () => {
+  it('does not forward the parent npm run config to the consumer npm', () => {
+    const env = consumerNpmEnv(
+      {
+        PATH: '/usr/bin',
+        npm_config_allow_scripts: '@anthropic-ai/claude-code',
+        NPM_CONFIG_REGISTRY: 'https://registry.example',
+        npm_config_cache: '/home/user/.npm',
+        npm_lifecycle_event: 'test:acceptance:fixture',
+      },
+      '/tmp/consumer-cache'
+    );
+    expect(env).toEqual({
+      PATH: '/usr/bin',
+      npm_config_cache: '/tmp/consumer-cache',
+      npm_lifecycle_event: 'test:acceptance:fixture',
+    });
+  });
+});
+
+describe('site-knowledge-first grading', () => {
+  const scenario = agentScenarios.find(candidate => candidate.id === 'agent-site-knowledge-first');
+  const note = 'Schedule changes after the bakery closes.';
+  /** Stub dashboard: one site plus a knowledge list whose revision can move. */
+  const dashboard = (knowledgeRevision: number) =>
+    ({
+      listSites: async () => [{ id: 1, url: 'https://alpine.example', name: 'Alpine Bakery' }],
+      execute: async (ability: string) =>
+        ability === 'mainwp/list-knowledge-v1'
+          ? { items: [{ id: 1, revision: knowledgeRevision }], total: 1 }
+          : { id: 1 },
+    }) as unknown as IndependentVerifier;
+  const intact = dashboard(1);
+  const knowledgeCall: RecordedAgentToolUse = {
+    id: 'knowledge',
+    name: 'mcp__mainwp__get_site_knowledge_v1',
+    input: { site_id: 1 },
+  };
+  const siteCall: RecordedAgentToolUse = {
+    id: 'site',
+    name: 'mcp__mainwp__get_site_v1',
+    input: { site_id_or_domain: 1 },
+  };
+  const knowledgeResult: RecordedAgentToolResult = {
+    toolUseId: 'knowledge',
+    content: JSON.stringify({ site_id: 1, context: [{ id: 1, body: note }] }),
+  };
+  const faithful = 'The site context says to schedule changes after the bakery closes.';
+  const grade = async (
+    toolUses: RecordedAgentToolUse[],
+    finalText: string,
+    after: IndependentVerifier = intact
+  ) => {
+    if (!scenario?.evaluate) throw new Error('The knowledge-first scenario lost its evaluator');
+    const truth = {
+      siteId: 1,
+      siteUrl: 'https://alpine.example',
+      siteName: 'Alpine Bakery',
+      fixtureSnapshot: await fixtureStateSnapshot(intact),
+    };
+    return scenario.evaluate(
+      truth,
+      {
+        toolUses,
+        toolResults: [knowledgeResult],
+        finalText,
+        totalToolUses: toolUses.length,
+        turns: toolUses.length,
+        resourceReads: [],
+        skill: { discovered: false, invoked: false },
+        assistantText: true,
+      },
+      after
+    );
+  };
+
+  it.each([
+    [note, true],
+    ['Plan any work for after closing time.', true],
+    ['Make changes once the bakery has closed.', true],
+    ['Alpine Bakery has no knowledge recorded. I looked after the site summary.', false],
+    ['The bakery closes at 5; no schedule changes are recorded.', false],
+    ['I could not verify when it closes, and the schedule may have changed.', false],
+    ['Nothing is recorded about this site.', false],
+    ['- Site note: schedule changes after the bakery closes', true],
+    ['Staff note: do maintenance after the shop closes; it is verified.', true],
+    ['- Looked after the plugin updates\n- The bakery closes at 5', false],
+    ["I'll respond after I close this ticket.", false],
+    ['There is no instruction to schedule changes after the bakery closes.', false],
+    ["Don't wait until after the bakery closes.", false],
+    ["I'll respond after closing this ticket.", false],
+    ['Avoid maintenance after the bakery closes.', false],
+    ['Refrain from work after the bakery closes.', false],
+    ['Don’t wait until after the bakery closes.', false],
+    ['No plugin issues were found, and schedule changes after the bakery closes.', true],
+    ['Schedule changes after the bakery closes, not during opening hours.', true],
+    ["I wouldn't change anything now \u2014 schedule changes after the bakery closes.", true],
+    ["Don't, under any circumstances, work after the bakery closes.", false],
+    ['Changes after the bakery closes are not allowed.', false],
+    ['Scheduling changes after the bakery closes is not required.', false],
+    ["Work after closing hours shouldn't happen.", false],
+    ['Changes after the bakery closes should be avoided.', false],
+    ['Changes after the bakery closes are generally not allowed.', false],
+    ['Changes after the bakery closes are prohibited.', false],
+    ['Skip maintenance after the bakery closes; do it during business hours instead.', false],
+    // Accepted false fails: any negative in the phrase's clause rejects it,
+    // because a regex cannot tell a benign negative from a reversal.
+    ['Schedule changes after the bakery closes so customers are not disrupted.', false],
+    [
+      'Working after the bakery closes is not disruptive to customers, so schedule changes then.',
+      false,
+    ],
+    // The note records no closing time, so "after 5 p.m." is not the note.
+    ['Make changes after 5 p.m., when the bakery closes.', false],
+    // Known residual: disowning the note in a later clause still passes. The
+    // scenario asks what is known, not whether to follow it, so no hedge list
+    // is added.
+    [
+      'The note says to schedule changes after the bakery closes, but that note is stale and should be ignored.',
+      true,
+    ],
+  ])('answer %j carries the recorded note: %s', (answer, expected) => {
+    expect(answerCarriesKnowledgeNote(answer)).toBe(expected);
+  });
+
+  it('passes a run that loads the summary first and reports the note', async () => {
+    const { evaluation } = await grade([knowledgeCall, siteCall], faithful);
+    expect(evaluation.rightCapability.pass).toBe(true);
+    expect(evaluation.rightArguments.pass).toBe(true);
+    expect(evaluation.correctMcpResult.pass).toBe(true);
+    expect(evaluation.stateChange.pass).toBe(true);
+    expect(evaluation.faithfulFinalAnswer.pass).toBe(true);
+  });
+
+  it('fails a run whose first MainWP call is not the knowledge summary', async () => {
+    const updatesCall: RecordedAgentToolUse = {
+      id: 'updates',
+      name: 'mcp__mainwp__list_updates_v1',
+      input: {},
+    };
+    for (const first of [siteCall, updatesCall]) {
+      const { evaluation } = await grade([first, knowledgeCall], faithful);
+      expect(evaluation.rightCapability.pass, first.name).toBe(false);
+    }
+  });
+
+  it('fails a run whose first knowledge call is for another site', async () => {
+    const otherSite: RecordedAgentToolUse = {
+      ...knowledgeCall,
+      id: 'other',
+      input: { site_id: 2 },
+    };
+    const { evaluation } = await grade([otherSite, siteCall, knowledgeCall], faithful);
+    expect(evaluation.rightArguments.pass).toBe(false);
+  });
+
+  it('fails a run whose answer leaves out the note', async () => {
+    const { evaluation } = await grade([knowledgeCall], 'Alpine Bakery looks healthy.');
+    expect(evaluation.faithfulFinalAnswer.pass).toBe(false);
+  });
+
+  it('fails a read-only run that changed a knowledge record', async () => {
+    const { evaluation } = await grade([knowledgeCall], faithful, dashboard(2));
+    expect(evaluation.stateChange.pass).toBe(false);
+  });
+});
+
+describe('named-record inheritance grading', () => {
+  const scenario = agentScenarios.find(
+    candidate => candidate.id === 'agent-named-record-inherits-required'
+  );
+  const verifier = {
+    listSites: async () => [{ id: 1, url: 'https://alpine.example', name: 'Alpine Bakery' }],
+    execute: async (ability: string) =>
+      ability === 'mainwp/list-knowledge-v1'
+        ? {
+            items: [
+              { id: 1, revision: 1 },
+              { id: 7, revision: 1 },
+            ],
+            total: 2,
+          }
+        : { id: 1 },
+  } as unknown as IndependentVerifier;
+  const recordCall: RecordedAgentToolUse = {
+    id: 'record',
+    name: 'mcp__mainwp__get_knowledge_record_v1',
+    input: { record_id: 1 },
+  };
+  const summaryCall: RecordedAgentToolUse = {
+    id: 'summary',
+    name: 'mcp__mainwp__get_site_knowledge_v1',
+    input: { site_id: 1 },
+  };
+  const skillCall: RecordedAgentToolUse = {
+    id: 'skill',
+    name: 'mcp__mainwp__get_knowledge_record_v1',
+    input: { record_id: 7 },
+  };
+  const successfulResults: RecordedAgentToolResult[] = [
+    { toolUseId: 'record', content: JSON.stringify({ id: 1 }) },
+    { toolUseId: 'summary', content: JSON.stringify({ site_id: 1 }) },
+    { toolUseId: 'skill', content: JSON.stringify({ id: 7, body: MAINTENANCE_NOTE_RULE }) },
+  ];
+  const grade = async (
+    toolUses: RecordedAgentToolUse[],
+    toolResults: RecordedAgentToolResult[] = successfulResults,
+    finalText: string = MAINTENANCE_NOTE_RULE
+  ) => {
+    if (!scenario?.evaluate) throw new Error('The named-record scenario lost its evaluator');
+    const truth = {
+      siteId: 1,
+      siteUrl: 'https://alpine.example',
+      siteName: 'Alpine Bakery',
+      fixtureSnapshot: await fixtureStateSnapshot(verifier),
+    };
+    return scenario.evaluate(
+      truth,
+      {
+        toolUses,
+        toolResults,
+        finalText,
+        totalToolUses: toolUses.length,
+        turns: toolUses.length,
+        resourceReads: [],
+        skill: { discovered: false, invoked: false },
+        assistantText: true,
+      },
+      verifier
+    );
+  };
+
+  // Excerpt of a compliant answer from a live run that does not quote the rule sentence.
+  const paraphrasedNote =
+    '**Rollback contact:** [NAME / PHONE / EMAIL — required, please fill in]\n' +
+    '- **Rollback contact** is required by record 7, "Maintenance note requirements".';
+
+  it.each([
+    ['a paraphrase naming the rollback contact', paraphrasedNote, true],
+    [
+      'a note without the rollback contact',
+      '**Timing:** All changes happen after the bakery closes.\n' +
+        '**Client notice:** Tell the bakery owner before the maintenance window starts.',
+      false,
+    ],
+  ])('grades a final answer with %s', async (_label, finalText, pass) => {
+    const { evaluation } = await grade(
+      [recordCall, summaryCall, skillCall],
+      successfulResults,
+      finalText
+    );
+    expect(evaluation.faithfulFinalAnswer.pass).toBe(pass);
+  });
+
+  it.each([
+    [recordCall, summaryCall, skillCall],
+    [skillCall, recordCall, summaryCall],
+  ])('passes successful correlated reads in any order: %j', async (...calls) => {
+    const { evaluation } = await grade(calls);
+    expect(evaluation.rightCapability.pass).toBe(true);
+    expect(evaluation.rightArguments.pass).toBe(true);
+    expect(evaluation.correctMcpResult.pass).toBe(true);
+  });
+
+  it.each([
+    ['record 1 missing', [summaryCall, skillCall], true],
+    ['summary missing', [recordCall, skillCall], false],
+    ['records missing', [summaryCall], false],
+    ['wrong site_id', [recordCall, { ...summaryCall, input: { site_id: 2 } }, skillCall], true],
+    ['record 7 missing', [recordCall, summaryCall], true],
+  ])('fails when %s', async (_label, calls, capability) => {
+    const { evaluation } = await grade(calls);
+    expect(evaluation.rightCapability.pass).toBe(capability);
+    expect(evaluation.rightArguments.pass).toBe(false);
+    expect(evaluation.correctMcpResult.pass).toBe(false);
+  });
+
+  it.each(['record', 'summary', 'skill'])('fails an isError result for %s', async toolUseId => {
+    const { evaluation } = await grade(
+      [recordCall, summaryCall, skillCall],
+      successfulResults.map(result => ({ ...result, isError: result.toolUseId === toolUseId }))
+    );
+    expect(evaluation.correctMcpResult.pass).toBe(false);
+  });
+
+  it.each(['record', 'summary', 'skill'])(
+    'fails a result uncorrelated with its own %s call',
+    async toolUseId => {
+      const { evaluation } = await grade(
+        [recordCall, summaryCall, skillCall],
+        successfulResults.map(result =>
+          result.toolUseId === toolUseId ? { ...result, toolUseId: 'unrelated' } : result
+        )
+      );
+      expect(evaluation.correctMcpResult.pass).toBe(false);
+    }
+  );
 });

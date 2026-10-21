@@ -7,8 +7,43 @@
 
 import { fetchAbilities, type Ability } from './abilities.js';
 import { Config } from './config.js';
+import { describeCredentialRejection, isCredentialRejection } from './credential-diagnostics.js';
 import { getErrorMessage, getHttpStatus } from './errors.js';
 import type { Logger } from './logging.js';
+
+// undici reports every network or TLS failure as "fetch failed" and keeps the
+// reason in error.cause.code. Only a constant-shaped code is repeated; the
+// cause message can carry hosts and addresses.
+const CAUSE_CODE_RE = /^[A-Z0-9_]{2,64}$/;
+const CERT_CAUSE_RE = /CERT|SELF_SIGNED|UNABLE_TO_VERIFY/;
+
+const CERT_HINT =
+  'The Dashboard\'s certificate is not trusted by the Node.js that runs this server. See "SSL certificate problem" at https://docs.mainwp.com/mcp-server/troubleshooting.';
+
+function causeNote(error: unknown): string {
+  let code: unknown;
+  // A getter or proxy on the cause can throw; its message must not replace the
+  // original failure, so an uninspectable cause adds nothing.
+  try {
+    const cause = error instanceof Error ? error.cause : undefined;
+    code = cause && typeof cause === 'object' ? (cause as { code?: unknown }).code : undefined;
+  } catch {
+    return '';
+  }
+  if (typeof code !== 'string' || !CAUSE_CODE_RE.test(code)) return '';
+  return CERT_CAUSE_RE.test(code) ? ` (${code}). ${CERT_HINT}` : ` (${code})`;
+}
+
+/**
+ * The Dashboard answered and refused these credentials. Retrying with the same
+ * values cannot help, unlike a network, TLS, or server failure.
+ */
+export class CredentialRejectedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'CredentialRejectedError';
+  }
+}
 
 /**
  * Validate credentials by attempting to fetch abilities from the MainWP Dashboard.
@@ -33,8 +68,18 @@ export async function validateCredentials(config: Config, logger: Logger): Promi
     // (DNS, SSL, timeout) which have no status to inspect.
     const status = getHttpStatus(error);
 
-    // Authentication failures (401/403) - provide auth-type specific guidance
-    if (status === 401 || status === 403) {
+    const code =
+      error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+    if (isCredentialRejection(status, code)) {
+      throw new CredentialRejectedError(
+        `Authentication failed: ${describeCredentialRejection(config, code)}`,
+        { cause: error }
+      );
+    }
+
+    // A bare 403 may come from a WAF or proxy rather than WordPress, so it
+    // keeps the generic guidance and the degraded retry path.
+    if (status === 403) {
       const authHint =
         config.authType === 'basic'
           ? 'Verify MAINWP_USER and MAINWP_APP_PASSWORD (or username/appPassword in settings.json) are correct and the user has REST API access.'
@@ -89,6 +134,8 @@ export async function validateCredentials(config: Config, logger: Logger): Promi
     }
 
     // Other errors - re-throw with prefix
-    throw new Error(`Credential validation failed: ${message}`, { cause: error });
+    throw new Error(`Credential validation failed: ${message}${causeNote(error)}`, {
+      cause: error,
+    });
   }
 }

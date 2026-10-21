@@ -11,6 +11,9 @@ import {
   decidePolicy,
   classifyDestructive,
   declaresUsableBooleanParam,
+  requiresUsableFalseParam,
+  declaresNullablePreviewToken,
+  resolveConfirmationParam,
   isToolAllowed,
   type PolicyDecision,
 } from './policy.js';
@@ -226,6 +229,31 @@ describe('declaresUsableBooleanParam', () => {
     expect(declaresUsableBooleanParam(properties, 'confirm')).toBe(expected);
   });
 
+  it.each([
+    ['enum containing only true rejects false', { confirm: { enum: [true] } }, false],
+    ['enum containing only false accepts false', { confirm: { enum: [false] } }, true],
+    ['const true rejects false', { confirm: { const: true } }, false],
+    ['const false accepts false', { confirm: { const: false } }, true],
+    ['enum containing both accepts false', { confirm: { enum: [true, false] } }, true],
+    ['boolean-true subschema accepts false', { confirm: true }, true],
+    ['boolean-false subschema rejects false', { confirm: false }, false],
+    ['empty object accepts false', { confirm: {} }, true],
+    ['boolean type accepts false', { confirm: { type: 'boolean' } }, true],
+    ['string type rejects false', { confirm: { type: 'string' } }, false],
+    ['union including boolean accepts false', { confirm: { type: ['boolean', 'null'] } }, true],
+    ['union excluding boolean rejects false', { confirm: { type: ['string', 'null'] } }, false],
+    [
+      'type still rejects false despite enum',
+      { confirm: { type: 'string', enum: [false] } },
+      false,
+    ],
+    ['const still rejects false despite enum', { confirm: { enum: [false], const: true } }, false],
+    ['enum still rejects false despite const', { confirm: { enum: [true], const: false } }, false],
+    ['inherited declaration rejects false', Object.create({ confirm: { type: 'boolean' } }), false],
+  ] as const)('%s', (_label, properties, expected) => {
+    expect(declaresUsableBooleanParam(properties, 'confirm', false)).toBe(expected);
+  });
+
   it('returns false for non-object property maps', () => {
     expect(declaresUsableBooleanParam(undefined, 'confirm')).toBe(false);
     expect(declaresUsableBooleanParam(null, 'confirm')).toBe(false);
@@ -235,5 +263,222 @@ describe('declaresUsableBooleanParam', () => {
 
   it('does not read inherited keys as declared parameters', () => {
     expect(declaresUsableBooleanParam({}, 'constructor')).toBe(false);
+  });
+});
+
+describe('requiresUsableFalseParam', () => {
+  const properties = {
+    confirm: { type: 'boolean' },
+    dry_run: { type: 'boolean' },
+  };
+
+  it.each([
+    ['required confirm', { properties, required: ['confirm', 'dry_run'] }, 'confirm', true],
+    ['required dry_run', { properties, required: ['dry_run'] }, 'dry_run', true],
+    [
+      'optional confirm next to required dry_run',
+      { properties, required: ['dry_run'] },
+      'confirm',
+      false,
+    ],
+    [
+      'optional dry_run next to required confirm',
+      { properties, required: ['confirm'] },
+      'dry_run',
+      false,
+    ],
+    ['absent required', { properties }, 'confirm', false],
+    ['empty required', { properties, required: [] }, 'confirm', false],
+    ['different required key', { properties, required: ['confirm_other'] }, 'confirm', false],
+    ['string required', { properties, required: 'confirm' }, 'confirm', false],
+    ['object required', { properties, required: { 0: 'confirm' } }, 'confirm', false],
+    ['nested required', { properties, required: [['confirm']] }, 'confirm', false],
+    ['null required', { properties, required: null }, 'confirm', false],
+    [
+      'inherited required',
+      Object.assign(Object.create({ required: ['confirm'] }), { properties }),
+      'confirm',
+      false,
+    ],
+    ['absent declaration', { properties: {}, required: ['confirm'] }, 'confirm', false],
+    [
+      'inherited declaration',
+      { properties: Object.create(properties), required: ['confirm'] },
+      'confirm',
+      false,
+    ],
+    [
+      'true-only const',
+      { properties: { confirm: { const: true } }, required: ['confirm'] },
+      'confirm',
+      false,
+    ],
+    [
+      'true-only enum',
+      { properties: { confirm: { enum: [true] } }, required: ['confirm'] },
+      'confirm',
+      false,
+    ],
+    [
+      'false-only const',
+      { properties: { dry_run: { const: false } }, required: ['dry_run'] },
+      'dry_run',
+      true,
+    ],
+    [
+      'false-only enum',
+      { properties: { dry_run: { enum: [false] } }, required: ['dry_run'] },
+      'dry_run',
+      true,
+    ],
+    [
+      'boolean-true declaration',
+      { properties: { confirm: true }, required: ['confirm'] },
+      'confirm',
+      true,
+    ],
+    [
+      'boolean-false declaration',
+      { properties: { confirm: false }, required: ['confirm'] },
+      'confirm',
+      false,
+    ],
+    [
+      'string declaration',
+      { properties: { confirm: { type: 'string' } }, required: ['confirm'] },
+      'confirm',
+      false,
+    ],
+    ['null schema', null, 'confirm', false],
+    ['string schema', 'confirm', 'confirm', false],
+    ['array schema', [], 'confirm', false],
+  ] as const)('%s', (_label, schema, name, expected) => {
+    expect(requiresUsableFalseParam(schema, name)).toBe(expected);
+  });
+});
+
+describe('declaresNullablePreviewToken', () => {
+  it.each([
+    ['nullable string', { preview_token: { type: ['string', 'null'] } }, true],
+    ['reversed types', { preview_token: { type: ['null', 'string'] } }, true],
+    ['additional type', { preview_token: { type: ['string', 'null', 'number'] } }, true],
+    [
+      'null prototype subschema',
+      { preview_token: Object.assign(Object.create(null), { type: ['string', 'null'] }) },
+      true,
+    ],
+    ['string only', { preview_token: { type: 'string' } }, false],
+    ['string array only', { preview_token: { type: ['string'] } }, false],
+    ['null only', { preview_token: { type: ['null'] } }, false],
+    ['missing type', { preview_token: { description: 'Preview token' } }, false],
+    ['empty subschema', { preview_token: {} }, false],
+    ['true schema', { preview_token: true }, false],
+    ['false schema', { preview_token: false }, false],
+    ['null subschema', { preview_token: null }, false],
+    ['array subschema', { preview_token: ['string', 'null'] }, false],
+    ['string subschema', { preview_token: 'string' }, false],
+    ['number subschema', { preview_token: 1 }, false],
+    ['anyOf types', { preview_token: { anyOf: [{ type: 'string' }, { type: 'null' }] } }, false],
+    ['oneOf types', { preview_token: { oneOf: [{ type: 'string' }, { type: 'null' }] } }, false],
+    ['missing property', {}, false],
+    ['null properties', null, false],
+    ['undefined properties', undefined, false],
+    ['array properties', [], false],
+    ['string properties', 'preview_token', false],
+    ['number properties', 1, false],
+    ['boolean properties', true, false],
+    ['inherited property', Object.create({ preview_token: { type: ['string', 'null'] } }), false],
+    ['inherited type', { preview_token: Object.create({ type: ['string', 'null'] }) }, false],
+  ] as const)('%s', (_label, properties, expected) => {
+    expect(declaresNullablePreviewToken(properties)).toBe(expected);
+  });
+});
+
+describe('resolveConfirmationParam', () => {
+  it('resolves the conventional confirm property', () => {
+    expect(
+      resolveConfirmationParam({
+        type: 'object',
+        required: ['confirm_removals'],
+        properties: {
+          confirm: { type: 'boolean' },
+          confirm_removals: { type: 'boolean' },
+        },
+      })
+    ).toBe('confirm');
+  });
+
+  it('fails closed when confirm sits next to a pinned confirm_*', () => {
+    // A preview strips only the resolved field, so the pinned one would reach
+    // upstream as true before any token exists.
+    expect(
+      resolveConfirmationParam({
+        type: 'object',
+        required: ['confirm_lockout_risk'],
+        properties: {
+          confirm: { type: 'boolean' },
+          confirm_lockout_risk: { type: 'boolean', enum: [true] },
+          dry_run: { type: 'boolean' },
+        },
+      })
+    ).toBeUndefined();
+  });
+
+  it('accepts one required schema-named confirmation field that permits true', () => {
+    expect(
+      resolveConfirmationParam({
+        type: 'object',
+        required: ['site_id', 'confirm_lockout_risk'],
+        properties: {
+          site_id: { type: 'integer' },
+          confirm_lockout_risk: { type: 'boolean', enum: [true] },
+        },
+      })
+    ).toBe('confirm_lockout_risk');
+    expect(
+      resolveConfirmationParam({
+        type: 'object',
+        required: ['confirm_lockout_risk'],
+        properties: { confirm_lockout_risk: { type: 'boolean', const: true } },
+      })
+    ).toBe('confirm_lockout_risk');
+  });
+
+  it('does not treat required domain flags that permit false as confirmation', () => {
+    for (const property of [{ type: 'boolean' }, { type: 'boolean', enum: [true, false] }]) {
+      expect(
+        resolveConfirmationParam({
+          type: 'object',
+          required: ['confirm_removals'],
+          properties: { confirm_removals: property },
+        })
+      ).toBeUndefined();
+    }
+  });
+
+  it('fails closed for optional, unusable, or ambiguous named fields', () => {
+    expect(
+      resolveConfirmationParam({
+        type: 'object',
+        properties: { confirm_lockout_risk: { type: 'boolean', enum: [true] } },
+      })
+    ).toBeUndefined();
+    expect(
+      resolveConfirmationParam({
+        type: 'object',
+        required: ['confirm_lockout_risk'],
+        properties: { confirm_lockout_risk: { type: 'boolean', enum: [false] } },
+      })
+    ).toBeUndefined();
+    expect(
+      resolveConfirmationParam({
+        type: 'object',
+        required: ['confirm_lockout_risk', 'confirm_recovery_action'],
+        properties: {
+          confirm_lockout_risk: { type: 'boolean', enum: [true] },
+          confirm_recovery_action: { type: 'boolean', enum: [true] },
+        },
+      })
+    ).toBeUndefined();
   });
 });

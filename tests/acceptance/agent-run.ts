@@ -74,6 +74,7 @@ import { packAndInstall, type PackedPackage } from './lib/pack.js';
 import { Redactor } from './lib/redact.js';
 import { launchServer } from './lib/server.js';
 import { IndependentVerifier, type VerifiedSite } from './lib/verify.js';
+import { ROLLBACK_CONTACT_PHRASE } from './fixture-knowledge.js';
 import { verifierListAll } from './scenarios/ability-reads.js';
 import type { Artifacts } from './lib/artifacts.js';
 
@@ -183,6 +184,7 @@ type AgentResultStatus = 'passed' | 'failed' | 'unverified' | 'skill-not-loaded'
 interface AgentResult {
   id: string;
   status: AgentResultStatus;
+  serverEnv?: Record<string, string>;
   arm?: AgentArmId;
   iteration?: number;
   model?: string;
@@ -271,6 +273,7 @@ const COMMAND_READ_TOOLS = [
   ...COMMAND_UPDATE_READ_TOOLS,
   ...COMMAND_SITE_DETAIL_TOOLS,
   ...COMMAND_HEALTH_TOOLS,
+  'get_network_snapshot_v1',
   'get_abandoned_plugins_v1',
   'get_abandoned_themes_v1',
   'list_clients_v1',
@@ -395,7 +398,161 @@ async function pluginUpdateSiteUrls(
   return updateSiteUrls.sort();
 }
 
+const KNOWLEDGE_NOTE_PHRASE =
+  /\b(?:(?:after|once)\s+(?:the\s+)?(?:bakery|shop|store|business)\s+(?:has\s+|is\s+)?clos(?:es|ed)|after\s+closing\s+(?:time|hours))\b/i;
+const NEGATION =
+  /\b(?:no|not|never|nothing|none|without|avoid\w*|refrain\w*|skip\w*|forbid\w*|prohibit\w*)\b|n't\b/i;
+
+/**
+ * The site's context record says to schedule changes after the bakery closes.
+ * An answer carries it when a clause holds that phrase ("after"/"once" the
+ * business closes, or "after closing time/hours") and none of the NEGATION
+ * words; a reversal worded outside that list still passes. Clauses split on
+ * sentence punctuation, dashes, line breaks, a comma before
+ * "and"/"but"/"so"/"then" and a comma before "not", so an unrelated negative
+ * in its own clause ("No issues were found, and ...", "..., not during
+ * opening hours") does not reject the answer. A negative in the phrase's own
+ * clause always does, whether it reverses the note ("Changes after the
+ * bakery closes are generally not allowed") or not ("... so customers are
+ * not disrupted"): telling those apart needs meaning a regex does not have,
+ * and a false fail is the safe direction. Curly apostrophes count as
+ * straight ones. A later clause that disowns the note (", but that note is
+ * stale", ", not anymore") still passes; correctMcpResult separately
+ * requires the record body.
+ */
+export function answerCarriesKnowledgeNote(text: string): boolean {
+  return text
+    .replace(/[\u2018\u2019\u02bc]/g, "'")
+    .split(/[.;:!?\n\u2013\u2014]|,\s*(?:and|but|so|then)\b|,\s*(?=not\b)/i)
+    .some(clause => KNOWLEDGE_NOTE_PHRASE.test(clause) && !NEGATION.test(clause));
+}
+
 export const agentScenarios: AgentScenario[] = [
+  {
+    id: 'agent-site-knowledge-first',
+    target: 'fixture',
+    serverEnv: { MAINWP_SAFE_MODE: 'true' },
+    task: truth =>
+      `What do we know about site ${truth.siteId} (${truth.siteUrl}) before I touch it?`,
+    expectedTools: ['get_site_knowledge_v1'],
+    groundTruth: async verifier => {
+      const site = (await verifier.listSites()).find(site => site.id === 1);
+      if (!site) throw new Error('Knowledge scenario needs fixture site 1');
+      return {
+        siteId: site.id,
+        siteUrl: site.url,
+        siteName: site.name,
+        fixtureSnapshot: await fixtureStateSnapshot(verifier),
+      };
+    },
+    stateGuard: readOnlyStateGuard,
+    evaluate: async (truth, collected, verifier) => {
+      const scenario = agentScenarios.find(
+        scenario => scenario.id === 'agent-site-knowledge-first'
+      )!;
+      const evaluation = evaluate(scenario, truth, collected);
+      const knowledgeUses = collected.toolUses.filter(tool =>
+        toolFamilyMatches(tool.name, ['get_site_knowledge_v1'])
+      );
+      const firstMainwpUse = collected.toolUses[0];
+      const firstIsKnowledge =
+        firstMainwpUse !== undefined &&
+        toolFamilyMatches(firstMainwpUse.name, ['get_site_knowledge_v1']);
+      // The first call has to load this site's knowledge; a summary of another
+      // site first, then this one later, is not "knowledge first".
+      const targeted =
+        firstIsKnowledge &&
+        firstMainwpUse.input !== null &&
+        typeof firstMainwpUse.input === 'object' &&
+        Number((firstMainwpUse.input as Record<string, unknown>).site_id) === truth.siteId;
+      const results = toolResultsForUses(knowledgeUses, collected.toolResults);
+      const expectedBody = 'Schedule changes after the bakery closes.';
+      evaluation.rightCapability = {
+        pass: firstIsKnowledge,
+        evidence: collected.toolUses.map(tool => tool.name),
+      };
+      evaluation.rightArguments = {
+        pass: targeted,
+        evidence: knowledgeUses.map(tool => tool.input),
+      };
+      evaluation.correctMcpResult = {
+        pass:
+          results.length > 0 &&
+          results.every(result => !result.isError) &&
+          JSON.stringify(results).includes(expectedBody),
+        evidence: results,
+      };
+      const guard = await readOnlyStateGuard(truth, verifier);
+      evaluation.stateChange = { pass: guard.ok, evidence: guard.evidence };
+      evaluation.faithfulFinalAnswer = {
+        pass: answerCarriesKnowledgeNote(collected.finalText),
+        evidence: collected.finalText,
+      };
+      return { evaluation };
+    },
+  },
+  {
+    id: 'agent-named-record-inherits-required',
+    target: 'fixture',
+    serverEnv: { MAINWP_SAFE_MODE: 'true' },
+    task: truth =>
+      `Read knowledge record 1 (Bakery maintenance) and use it to draft a maintenance note for site ${truth.siteId} (${truth.siteUrl}). Do not change the site.`,
+    expectedTools: ['get_knowledge_record_v1', 'get_site_knowledge_v1'],
+    groundTruth: async verifier => {
+      const site = (await verifier.listSites()).find(site => site.id === 1);
+      if (!site) throw new Error('Knowledge scenario needs fixture site 1');
+      return {
+        siteId: site.id,
+        siteUrl: site.url,
+        siteName: site.name,
+        fixtureSnapshot: await fixtureStateSnapshot(verifier),
+      };
+    },
+    stateGuard: readOnlyStateGuard,
+    evaluate: async (truth, collected, verifier) => {
+      const scenario = agentScenarios.find(
+        scenario => scenario.id === 'agent-named-record-inherits-required'
+      )!;
+      const evaluation = evaluate(scenario, truth, collected);
+      const requiredReads = [
+        { family: 'get_knowledge_record_v1', key: 'record_id', value: 1 },
+        { family: 'get_site_knowledge_v1', key: 'site_id', value: 1 },
+        { family: 'get_knowledge_record_v1', key: 'record_id', value: 7 },
+      ];
+      const uses = requiredReads.map(read =>
+        collected.toolUses.filter(tool => toolFamilyMatches(tool.name, [read.family]))
+      );
+      const targetedUses = uses.map((tools, index) =>
+        tools.filter(tool => {
+          const input = asRecord(tool.input);
+          return (
+            input !== undefined &&
+            Number(input[requiredReads[index].key]) === requiredReads[index].value
+          );
+        })
+      );
+      const results = targetedUses.map(tools => toolResultsForUses(tools, collected.toolResults));
+      evaluation.rightCapability = {
+        pass: uses.every(tools => tools.length > 0),
+        evidence: collected.toolUses.map(tool => tool.name),
+      };
+      evaluation.rightArguments = {
+        pass: targetedUses.every(tools => tools.length > 0),
+        evidence: targetedUses,
+      };
+      evaluation.correctMcpResult = {
+        pass: results.every(results => results.some(result => !result.isError)),
+        evidence: results,
+      };
+      const guard = await readOnlyStateGuard(truth, verifier);
+      evaluation.stateChange = { pass: guard.ok, evidence: guard.evidence };
+      evaluation.faithfulFinalAnswer = {
+        pass: collected.finalText.toLowerCase().includes(ROLLBACK_CONTACT_PHRASE),
+        evidence: collected.finalText,
+      };
+      return { evaluation };
+    },
+  },
   {
     id: 'agent-count-sites',
     target: 'live',
@@ -1068,27 +1225,30 @@ export const agentScenarios: AgentScenario[] = [
     },
     evaluate: async (truth, collected) => {
       if (truth.count === undefined) throw new Error('Session-cap ground truth was incomplete');
+      const expectedTotal = truth.count;
       const capIndex = collected.toolResults.findIndex(result =>
         resultsIncludeSessionCap([result])
       );
       const capHit = capIndex !== -1;
-      // "Narrowed scope" is measured from the calls after the cap, not inferred
-      // from prose — and re-issuing the same call is not narrowing, so the
-      // recovery must either be materially narrower or use a summary
-      // capability, and it must have succeeded.
+      // A total obtained before the cap remains usable; repeating the capped
+      // request does not narrow its scope.
       const cappedCallId = capHit ? collected.toolResults[capIndex]?.toolUseId : undefined;
       const cappedUseIndex = cappedCallId
         ? collected.toolUses.findIndex(tool => tool.id === cappedCallId)
         : -1;
       const cappedUse = cappedUseIndex === -1 ? undefined : collected.toolUses[cappedUseIndex];
-      const laterUses = cappedUseIndex === -1 ? [] : collected.toolUses.slice(cappedUseIndex + 1);
-      const recoveryUse = laterUses.find(tool => {
+      const otherUses =
+        cappedUseIndex === -1
+          ? []
+          : collected.toolUses.filter((_, index) => index !== cappedUseIndex);
+      const recoveryUse = otherUses.find(tool => {
         if (isSameToolCall(cappedUse, tool)) return false;
         const results = toolResultsForUses([tool], collected.toolResults);
         if (results.length === 0 || results.some(result => result.isError === true)) return false;
         return (
-          toolFamilyMatches(tool.name, SESSION_CAP_SUMMARY_TOOLS) ||
-          argumentsAreNarrower(cappedUse?.input, tool.input)
+          (toolFamilyMatches(tool.name, SESSION_CAP_SUMMARY_TOOLS) ||
+            (tool.name === cappedUse?.name && argumentsAreNarrower(cappedUse.input, tool.input))) &&
+          resultsStateTotal(results, expectedTotal)
         );
       });
       const recoveryResults = recoveryUse
@@ -1824,6 +1984,15 @@ export const agentScenarios: AgentScenario[] = [
   },
 ];
 
+for (const id of ['agent-site-knowledge-first', 'agent-named-record-inherits-required']) {
+  const scenario = agentScenarios.find(scenario => scenario.id === id)!;
+  agentScenarios.push({
+    ...scenario,
+    id: `${id}-compact`,
+    serverEnv: { ...scenario.serverEnv, MAINWP_SCHEMA_VERBOSITY: 'compact' },
+  });
+}
+
 export interface AgentCliOptions {
   scenarioIds: string[];
   list: boolean;
@@ -2265,7 +2434,11 @@ export async function fixtureStateSnapshot(verifier: IndependentVerifier): Promi
   for (const site of sites) {
     details.push(await verifier.execute('mainwp/get-site-v1', { site_id_or_domain: site.id }));
   }
-  return canonicalJson({ sites, details });
+  return canonicalJson({
+    sites,
+    details,
+    knowledge: await verifier.execute('mainwp/list-knowledge-v1', { per_page: 100 }),
+  });
 }
 
 /** True when a successful result carries the independently verified total. */
@@ -2774,6 +2947,7 @@ async function main(): Promise<void> {
         } catch (error) {
           results.push({
             id: scenario.id,
+            serverEnv: scenario.serverEnv,
             ...armFields,
             status: 'unverified',
             toolUses: [],
@@ -2803,6 +2977,7 @@ async function main(): Promise<void> {
           if (!precheck.ok) {
             results.push({
               id: scenario.id,
+              serverEnv: scenario.serverEnv,
               ...armFields,
               status: 'unverified',
               toolUses: [],
@@ -2845,6 +3020,7 @@ async function main(): Promise<void> {
         if (!claudeAvailable) {
           results.push({
             id: scenario.id,
+            serverEnv: scenario.serverEnv,
             ...armFields,
             status: 'unverified',
             toolUses: [],
@@ -2952,6 +3128,7 @@ async function main(): Promise<void> {
             : undefined;
           results.push({
             id: scenario.id,
+            serverEnv: scenario.serverEnv,
             ...armFields,
             status: classifyAgentResult({
               skillMissing: commandMissing,
@@ -3014,6 +3191,7 @@ async function main(): Promise<void> {
               .join(' ') || undefined;
         results.push({
           id: scenario.id,
+          serverEnv: scenario.serverEnv,
           ...armFields,
           status,
           model: collected.model,

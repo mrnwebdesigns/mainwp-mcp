@@ -3,19 +3,208 @@
 All notable changes to mainwp-mcp are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [Unreleased] - MRN integration
+
+### Added
+
+Guarded MRN plugin/theme maintenance with exact-version previews, verified
+remote backup receipts, single-use confirmation and independently bound installed
+readback. Core and stock update execution remain unavailable in this path.
+
+### Changed
+
+Integrate official 1.5.1 while retaining MRN's 50 MiB ZIP contract: schema-declared
+strings allow up to 69,905,068 base64 characters. The older MRN 100 MiB ceiling
+is superseded. Upstream schema-aware identifier and recursive validation retain
+the prior MRN compatibility behavior.
+
+## [1.5.1] - 2026-10-13
+
+### Changed
+
+The server instructions and the `mainwp-dashboard` skill now tell agents to load a site's knowledge summary
+(`get_site_knowledge_v1`, when the Dashboard offers it) before advising on, planning or drafting work for that site,
+even after reading one record the user named or a knowledge list. Neither shows which client and agency records apply
+to the site. For client-wide work, agents load the client's summary (`get_client_knowledge_v1`, when the Dashboard
+offers it) and then each site's summary. When a summary cannot be loaded, agents tell the user which knowledge was not
+loaded. The skill also says that showing one record the user asked for needs only that record.
+
+## [1.5.0] - 2026-10-10
+
+### Added
+
+An MCP Bundle for Claude Desktop. Each GitHub release now includes `mainwp-mcp.mcpb`. Open it in Claude Desktop, or
+install it from Settings > Extensions > Advanced settings > Install extension, and you no longer need to edit
+`claude_desktop_config.json`. Claude Desktop asks for the Dashboard URL, WordPress username and Application Password,
+and stores the password in the operating system's keychain. The newest bundle is always at
+<https://github.com/mainwp/mainwp-mcp/releases/latest/download/mainwp-mcp.mcpb>. The bundle is not code-signed. On
+Claude Desktop's built-in Node.js it cannot reach a Dashboard whose certificate is not publicly trusted, such as a
+local development site.
+
+Each release also includes `mainwp-mcp.mcpb.sha256`, and the bundle has a build provenance attestation. To check a
+download, run these commands in the folder that holds both files:
+
+```sh
+sha256sum -c mainwp-mcp.mcpb.sha256       # macOS without sha256sum: shasum -a 256 -c mainwp-mcp.mcpb.sha256
+gh attestation verify mainwp-mcp.mcpb --repo mainwp/mainwp-mcp
+```
+
+### Changed
+
+When the server cannot connect to the Dashboard, the startup error now includes the underlying network or TLS error
+code, for example `fetch failed (DEPTH_ZERO_SELF_SIGNED_CERT)`. A certificate error code also adds a link to the "SSL
+certificate problem" troubleshooting section.
+
+Setup guidance for rejected or unreachable credentials, and the `mainwp_configure` refusal when credentials are
+already loaded, now explain how to change the values in the Claude Desktop extension: under Settings > Extensions >
+MainWP > Configure, then turn the extension off and on.
+
+Updated the runtime dependency `undici` to 7.30.0.
+
+## [1.4.0] - 2026-10-06
+
+### Added
+
+Agency, client and site knowledge. On MainWP Dashboard 6.3 and later the server exposes the Dashboard's knowledge abilities (agency, client and site summaries, and listing, reading, creating, updating and deleting knowledge records) like any other ability. Knowledge is coming in MainWP 6.3 but available now in the [Early Release program](https://mainwp.com/add-on/early-access/). The troubleshooting, maintenance and update workflows load a site's knowledge before planning, and the `mainwp-dashboard` skill explains how to use it: verified skill records and context, written or reviewed by a Dashboard user, guide the work; unverified records are information only, and one that contains instructions addressed to an AI agent is named to the user in a separate note instead of being followed; memories are history; skill records are listed with a description, and a record is opened before its content is described or followed. When verified records conflict, the more specific level wins, and a required record wins over records at more specific levels: a required agency record over client and site records, a required client record over site records. Only a person using the Dashboard can mark a record required or change a required one; the abilities refuse it. The update workflow also loads the ignored-updates list, names the ignored items in scope, and holds back or asks about an item that verified context or a verified skill argues against; an unverified record or a memory is raised with the user instead.
+
+The server sends instructions to the client at initialize. They say that verified knowledge skills and context guide the work, that unverified records are information only and an unverified record with instructions addressed to an AI agent is named to the user instead of followed, that memories are history, that skills are listed with a description, that no record authorizes a change to a site, and that a record is opened before its content is described or followed. They also ask for the user's approval before any call that changes sites, say that a tool's preview is the plan to show and that previews shown together can be approved in one reply, note that Dashboards before 6.3 do not gate updates, and forbid removing an update from the ignore list to force it through unless the user asks. Clients decide how to use server instructions.
+
+Update previews carry a readable summary. When a destructive update tool's preview is a valid Dashboard 6.3 update
+plan, the confirmation response adds `plan_summary`: per-site version changes, held-back items with the reason, major
+version jumps, the number of sites getting a core update, a line when the site list is partial, and, when the preview
+carries no preview token, a note that a newer version synced before confirmation is the one applied. The raw preview
+is still included. A preview that does not validate gets no summary. Dashboard 6.3 update previews are coming in
+MainWP 6.3 but available now in the [Early Release program](https://mainwp.com/add-on/early-access/).
+
+Abilities that take a `preview_token` from their own dry run can now be confirmed. When an ability supports `dry_run`
+and declares `preview_token` as a nullable string, the preview sends `null` for it (or leaves it out when it is
+optional) and keeps the token the preview returns. For the six MainWP update abilities (`run-updates-v1`,
+`update-all-v1` and `update-site-{core,plugins,themes,translations}-v1`) when `mainwp` is the primary namespace, the
+confirmed call always sends the token captured from the preview, and a different token from the caller is refused
+with `PREVIEW_REQUIRED` before anything is sent. For every other ability, a token string from the caller is sent
+unchanged and the stored token is used when the caller sent `null` or nothing. Abilities that declare
+`preview_token` as a plain string, or have no `dry_run`, send the same payloads as before. Dashboard 6.3 returns no
+preview token.
+
+An ability can now use a required `confirm_*` property as its confirmation parameter when its schema pins the value to
+`true` (`const: true` or `enum: [true]`). These tools confirm with a token and no preview, and an explicit `dry_run` is
+refused for them. A `confirm_*` property that also accepts `false` is treated as an ordinary input and passed through.
+Tool descriptions, help, and confirmation responses name the parameter the tool uses.
+
+`mainwp://status`, `mainwp_get_setup_status` and `mainwp_configure` report whether the ability catalog is complete, as
+`catalog: { truncated, pagesFetched, pageLimit }`. `truncated` is true when pagination stopped at the 50-page limit,
+when an `X-WP-TotalPages` header is malformed, when a full page arrives without one, and when the fetch stops short of
+the largest page count any page advertised. A truncated catalog stays connected and its tools stay usable; a complete
+refresh or a cache clear resets it.
+
+### Changed
+
+On MainWP Dashboard 6.3 and later, the update tools and `unignore_site_updates_v1` are destructive, so safe mode
+blocks them and, with confirmation enabled (the default), they go through the preview and confirmation flow. Update
+confirmation is coming in MainWP 6.3 but available now in the
+[Early Release program](https://mainwp.com/add-on/early-access/). With `MAINWP_REQUIRE_USER_CONFIRMATION=false` the caller must send `confirm: true` itself; the Dashboard rejects a call
+with neither `confirm` nor `dry_run`, and the error carries `mainwp_confirmation_required` as
+`error.data.upstream_code`. The update workflow prompt, the `/mainwp:update-workflow` command and the skill use the
+Dashboard's preview as the plan: one update call per group of sites with the same items, all previews shown together,
+one approval. On earlier Dashboards the update tools run without a preview, as before.
+
+Errors from the Dashboard with a 4xx status keep the WordPress error code. When the body is a well-formed WordPress
+error, the code is returned as `error.data.upstream_code` and the error maps to `SERVER_ERROR` (-32000) unless an
+existing mapping applies (401, 403, 404, 429 and `*_not_found` are unchanged). A replacement ability the Dashboard
+names in `data.replacement`, such as `unignore_site_updates_v1` for the retired unignore path, is returned as
+`error.data.replacement` when that tool exists and is allowed by `MAINWP_ALLOWED_TOOLS` and `MAINWP_BLOCKED_TOOLS`.
+Before, these errors surfaced as an internal error or were classified by words in their message. Malformed bodies and
+5xx errors are unchanged.
+
+Standard tool descriptions drop the Dashboard sentence "Call dry_run first and show the plan to the user." because the
+server adds its own preview reminder. Other Dashboard instructions and compact descriptions are unchanged.
+
+Rejected credentials are now reported at startup instead of producing a tool list that cannot work. When the Dashboard
+rejects the configured user or Application Password, the server enters a `credentials_rejected` state. The startup
+log, `mainwp_get_setup_status`, and 401 errors during a call name the rejected user, where each of `MAINWP_URL`,
+`MAINWP_USER`, and `MAINWP_APP_PASSWORD` came from, and what WordPress expects: the login name or email address rather
+than the display name, and an Application Password rather than the account's login password. Network, TLS, timeout,
+and 5xx failures keep the existing degraded retry path. The Application Password is never logged or returned.
+
+The startup log names the source of each connection setting instead of reporting "mixed". When an environment variable
+overrides a different value in `settings.json`, the startup log says so for that setting, and so does the setup status
+when the Dashboard rejects the credentials, so an edit to the file that had no effect is explained.
+
+String inputs now honor the `maxLength` an ability's input schema declares, up to a ceiling of 64 MiB. They were
+capped at 10,000 characters regardless of the schema, which blocked abilities that take base64 file uploads.
+Properties without a usable `maxLength` keep the 10,000-character default, and read-only tools are still bounded by
+the request URL limit. The stdio transport accepts messages large enough to carry the largest allowed string of ASCII
+text, such as base64.
+
+On GET and DELETE calls, boolean inputs are sent as `1` and `0` instead of `true` and `false` when the ability's
+schema plainly declares the position as a boolean. WordPress 6.9 and 7.0 pass query values through as raw strings, and
+PHP code that tests a flag by truthiness reads the string `"false"` as true. Undeclared keys, positions under `anyOf`,
+`oneOf` or `allOf`, items of arrays that declare `uniqueItems`, and type lists that name `integer`, `number`, `string` or `array` before `boolean` keep
+`true`/`false`.
+
+Abilities with a required input that may be `null` now receive their input as JSON, so a `null` stays `null`: GET
+calls send `input_json`, DELETE calls send a JSON body. This applies to `mainwp/` abilities whose input schema is an
+object without a default and requires a nullable key, and needs MainWP Dashboard 6.2 or later; on an older Dashboard
+the error says to update. A string sent for a top-level property whose declared types exclude `string` is converted to
+the declared type when it is in canonical form and refused before the call when it is not.
 
 ### Fixed
 
-Input validation now honors each ability parameter's declared JSON Schema
-`maxLength` instead of unconditionally rejecting every string over 10,000
-characters. Undeclared and malformed limits retain the conservative default,
-and declared limits remain bounded by a 100 MiB process-level ceiling.
+The `mainwp://site/{id}` resource works again. It sent `site_id` to an ability that requires `site_id_or_domain`, so
+the Dashboard rejected every read.
 
-Identifier validation now also honors the declared schema type. Numeric
-`site_id` and `site_ids` fields retain positive-integer enforcement, while
-string identifiers such as `rollout_id` are no longer rejected solely because
-their parameter name ends in `_id`.
+A confirmed write whose result exceeds the session data limit now says that the upstream request succeeded and the
+result was omitted (`execution_attempted`, `upstream_response_received`, `result_omitted`), and asks the caller to
+verify the operation's state before retrying. The error code stays `RESOURCE_EXHAUSTED`. It previously looked like
+nothing had run.
+
+A confirmed execution no longer forwards a `dry_run` argument from the caller, which could turn the approved call into
+another preview.
+
+`*_id` inputs whose schema declares a string type now accept string ids such as UUIDs. They are checked as non-empty
+strings of at most 255 characters with no control characters. Integer-typed and untyped ids keep the positive-integer
+rule.
+
+Calls with no arguments now send an input parameter when the ability declares an input schema: an empty `input`
+parameter on GET and DELETE when the schema has no default, and an empty `input` object on POST. Abilities that take
+their input as JSON send `input_json={}` on GET and a `{"input":{}}` body on DELETE instead. Abilities whose
+schema requires an input object rejected these calls before. An empty POST call to an ability without an input schema
+now sends `{}` instead of `{"input":{}}`.
+
+Abilities that require an explicit `confirm` or `dry_run` value now receive one. For an ability with a `confirm`
+parameter and a declared `dry_run`, previews and explicit dry runs send `dry_run: true`, plus `confirm: false` when
+`confirm` is required and accepts `false`. Confirmed calls send `confirm: true`, plus `dry_run: false` when `dry_run`
+is required and accepts `false`. Abilities that do not require these keys get the same payloads as before.
+
+`user_confirmed` and `confirmation_token` are no longer forwarded to the Dashboard on previews, explicit dry runs, or
+calls made with confirmation disabled. Abilities that reject undeclared input keys failed these calls.
+
+Input validation rejects non-finite numbers, so a preview and the call it confirms always carry the same values.
+Arrays nested inside arrays are checked against the same limits as other elements.
+
+A preview whose response exceeds the session data limit no longer leaves a pending confirmation behind, and no longer
+replaces the token from an earlier preview of the same call. The pending-preview cap now holds at 100 entries and
+evicts the oldest preview first.
+
+### Security
+
+Inputs an ability's schema marks `writeOnly` are redacted from results, confirmation previews, errors, and logs.
+Values shorter than four characters and booleans are left as they are, since matching them wherever they appear would
+mangle unrelated counts and keys. When a call carried `writeOnly` input and the request fails, the error reports the
+HTTP status and a short upstream error code instead of the upstream message. Redaction applies once the Dashboard
+marks the relevant inputs `writeOnly`.
+
+Transport errors no longer include the request's query string, which carries GET and DELETE input. A successful
+response that is not valid JSON fails with a fixed message instead of quoting the body.
+
+Pending previews store a digest of the call's arguments instead of the arguments themselves.
+
+Refreshed the dependency lockfile within declared ranges to clear published advisories in runtime dependencies:
+`undici` 7.29.1, `fast-uri` 3.1.8, `hono` 4.13.11, `ip-address` 10.7.2, `qs` 6.16.0, `proxy-addr` 2.0.8, `zod` 4.6.5,
+`jose` 6.2.12, and `ajv` 8.20.0. `npm audit` reports 0 vulnerabilities. `package.json` is unchanged.
+
+`@modelcontextprotocol/sdk` now requires 1.32.1 or later, which clears advisory GHSA-6qxp-vccf-f47h. The advisory
+covers the SDK's OAuth client, which this server does not use.
 
 ## [1.3.0] - 2026-08-07
 

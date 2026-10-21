@@ -7,10 +7,17 @@
 
 import crypto from 'crypto';
 import { Config, getAbilitiesApiUrl } from './config.js';
-import { McpErrorFactory, createHttpError, getErrorMessage } from './errors.js';
+import { McpErrorFactory, UpstreamHttpError, createHttpError, getErrorMessage } from './errors.js';
+import {
+  describeCredentialRejection,
+  isCredentialRejection,
+  safeWpErrorCode,
+} from './credential-diagnostics.js';
 import {
   RateLimiter,
   containsKnownSecret,
+  ownSchema,
+  propertySchema,
   redactKnownSecrets,
   redactKnownSecretsDeep,
   sanitizeError,
@@ -22,10 +29,18 @@ import {
   paginateApi,
   MAX_ERROR_BODY_BYTES,
   MAX_URL_LENGTH,
+  MAX_PAGES,
+  type PaginationMetadata,
 } from './http-client.js';
-import type { Logger } from './logging.js';
+import { withSecretRedaction, type Logger } from './logging.js';
 import { abilityNameToToolName, RESERVED_TOOL_NAMES } from './naming.js';
-import { classifyDestructive } from './policy.js';
+import { classifyDestructive, decidePolicy } from './policy.js';
+import { createWriteOnlyRedactor } from './write-only.js';
+
+// These mirror the limits the MainWP Dashboard enforces on its JSON input
+// carrier, so an over-size input is refused locally instead of by the server.
+const MAX_JSON_QUERY_INPUT_BYTES = 8192;
+const MAX_JSON_BODY_INPUT_BYTES = 1048576;
 
 /** Maximum age of stale cache before hard-failing (30 minutes) */
 const MAX_STALE_AGE_MS = 30 * 60 * 1000;
@@ -361,17 +376,37 @@ const abilitiesCache: CacheSlot<Ability[]> = emptySlot();
 const categoriesCache: CacheSlot<Category[]> = emptySlot();
 
 /**
- * Derived lookup indexes, keyed by the exact abilities array they were built
- * from. WeakMap (not module-level variables) so a caller that awaited one
- * fetch can never read indexes committed by a concurrent fetch for a
- * different config — the array reference it holds always resolves to its own
- * matching indexes. Entries are garbage-collected with their arrays.
+ * Derived lookup indexes and catalog metadata, keyed by the exact abilities
+ * array they were built from. WeakMap (not module-level variables) so a
+ * caller that awaited one fetch can never read indexes committed by a
+ * concurrent fetch for a different config — the array reference it holds
+ * always resolves to its own matching indexes. Entries are garbage-collected with their arrays.
  */
 interface AbilityIndexes {
   byName: Map<string, Ability>;
   byToolName: Map<string, Ability>;
+  catalog: PaginationMetadata;
 }
 const abilityIndexes = new WeakMap<Ability[], AbilityIndexes>();
+// Retain the lookup snapshot while an ability is executing, even after a refresh.
+const abilitySnapshots = new WeakMap<Ability, Ability[]>();
+
+export function getAbilityCatalogMetadata(abilities: Ability[]): PaginationMetadata {
+  const indexes = abilityIndexes.get(abilities);
+  if (!indexes) throw new Error('Ability snapshot has no catalog metadata');
+  return { ...indexes.catalog };
+}
+
+export function getCachedAbilityCatalogMetadata(config: Config | null): PaginationMetadata {
+  if (
+    config &&
+    abilitiesCache.data !== null &&
+    abilitiesCache.signature === cacheSignature(config)
+  ) {
+    return getAbilityCatalogMetadata(abilitiesCache.data);
+  }
+  return { truncated: false, pagesFetched: 0, pageLimit: MAX_PAGES };
+}
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -611,7 +646,7 @@ export async function fetchAbilities(
         config.maxResponseSize,
         logger
       ),
-    process: allAbilities => {
+    process: ({ items: allAbilities, truncated, pagesFetched, pageLimit }) => {
       const newAbilities = allAbilities.filter(a => {
         // Hostile-input guard: a null entry or non-string name would throw
         // below and poison the whole catalog refresh instead of being skipped.
@@ -785,7 +820,9 @@ export async function fetchAbilities(
           abilityIndexes.set(safeAbilities, {
             byName: newAbilitiesIndex,
             byToolName: newToolNameIndex,
+            catalog: { truncated, pagesFetched, pageLimit },
           });
+          for (const ability of safeAbilities) abilitySnapshots.set(ability, safeAbilities);
           // Notify callbacks if abilities changed
           if (hasChanged && hadCachedAbilities) {
             notifyCacheRefresh(logger);
@@ -825,7 +862,7 @@ export async function fetchCategories(
     // prefixes) and normalize the remote text — the mainwp://categories
     // resource returns these objects verbatim, so they get the same boundary
     // treatment as ability fields.
-    process: allCategories => ({
+    process: ({ items: allCategories }) => ({
       data: allCategories
         .filter(
           c =>
@@ -874,14 +911,70 @@ export async function getAbilityByToolName(
   return abilityIndexes.get(abilities)?.byToolName.get(toolName);
 }
 
+// With a key, the schema of that declared property of an object container;
+// without one, the items schema of an array container. Anything not plainly
+// declared returns undefined, so the boolean keeps its old spelling.
+function declaredChildSchema(schema: unknown, key?: string): Record<string, unknown> | undefined {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return undefined;
+  if (['anyOf', 'oneOf', 'allOf'].some(keyword => Object.hasOwn(schema, keyword))) {
+    return undefined;
+  }
+  const type = Object.hasOwn(schema, 'type') ? (schema as Record<string, unknown>).type : undefined;
+  const containerType = key === undefined ? 'array' : 'object';
+  const otherContainerType = key === undefined ? 'object' : 'array';
+  if (
+    type !== containerType &&
+    !(
+      Array.isArray(type) &&
+      type.every(item => typeof item === 'string') &&
+      type.includes(containerType) &&
+      !type.includes(otherContainerType)
+    )
+  ) {
+    return undefined;
+  }
+  // WordPress checks uniqueItems on the raw strings and again after converting
+  // them. [false, "false"] sent as "0" and "false" passes the first check, then
+  // fails the second, and WordPress 7.1 falls back to the raw input for the
+  // whole call. Keeping true/false leaves that request rejected as before.
+  if (key === undefined && Object.hasOwn(schema, 'uniqueItems')) return undefined;
+  return key === undefined ? ownSchema(schema, 'items') : propertySchema(schema, key);
+}
+
+function readsAsBoolean(schema: unknown): boolean {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  if (['anyOf', 'oneOf', 'allOf'].some(keyword => Object.hasOwn(schema, keyword))) return false;
+  const type = Object.hasOwn(schema, 'type') ? (schema as Record<string, unknown>).type : undefined;
+  if (typeof type === 'string') return type === 'boolean';
+  if (!Array.isArray(type) || !type.every(item => typeof item === 'string')) return false;
+  const booleanIndex = type.indexOf('boolean');
+  return (
+    booleanIndex !== -1 &&
+    !type
+      .slice(0, booleanIndex)
+      .some(item => ['integer', 'number', 'string', 'array'].includes(item))
+  );
+}
+
 /**
- * Serialize input to PHP-style query string for GET requests.
- * WordPress REST API parses PHP array notation: input[key][]=value
+ * Serialize input to a PHP-style query string for GET and DELETE requests.
+ * WordPress parses PHP array notation: input[key][]=value
+ *
+ * Only plainly declared boolean paths use 1/0. WordPress before 7.1 passes
+ * query input as raw strings, and PHP truthiness treats "false" as true but
+ * "0" as false.
+ *
+ * WordPress 7.1 takes the first declared type that matches. Positions that
+ * are not plainly declared boolean through typed containers keep the old
+ * true/false spelling to avoid changing the type WordPress reads.
  */
-function serializeToPhpQueryString(input: Record<string, unknown>): string {
+function serializeToPhpQueryString(input: Record<string, unknown>, schema: unknown): string {
   const params: string[] = [];
+  const scalarString = (value: unknown, valueSchema: unknown): string =>
+    typeof value === 'boolean' && readsAsBoolean(valueSchema) ? (value ? '1' : '0') : String(value);
 
   for (const [key, value] of Object.entries(input)) {
+    const valueSchema = declaredChildSchema(schema, key);
     if (Array.isArray(value)) {
       // Arrays: input[key][]=val1&input[key][]=val2
       for (const item of value) {
@@ -890,7 +983,9 @@ function serializeToPhpQueryString(input: Record<string, unknown>): string {
             `Unsupported nested query parameter at "${key}": arrays may contain only scalar values`
           );
         }
-        params.push(`input[${encodeURIComponent(key)}][]=${encodeURIComponent(String(item))}`);
+        params.push(
+          `input[${encodeURIComponent(key)}][]=${encodeURIComponent(scalarString(item, declaredChildSchema(valueSchema)))}`
+        );
       }
     } else if (typeof value === 'object' && value !== null) {
       // Nested objects: input[key][subkey]=val
@@ -901,16 +996,111 @@ function serializeToPhpQueryString(input: Record<string, unknown>): string {
           );
         }
         params.push(
-          `input[${encodeURIComponent(key)}][${encodeURIComponent(subKey)}]=${encodeURIComponent(String(subVal))}`
+          `input[${encodeURIComponent(key)}][${encodeURIComponent(subKey)}]=${encodeURIComponent(scalarString(subVal, declaredChildSchema(valueSchema, subKey)))}`
         );
       }
     } else if (value !== undefined && value !== null) {
       // Scalars: input[key]=val
-      params.push(`input[${encodeURIComponent(key)}]=${encodeURIComponent(String(value))}`);
+      params.push(
+        `input[${encodeURIComponent(key)}]=${encodeURIComponent(scalarString(value, valueSchema))}`
+      );
     }
   }
 
   return params.length > 0 ? '?' + params.join('&') : '';
+}
+
+function isPlainSchemaObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return (
+    (prototype === null || prototype === Object.prototype) &&
+    !Object.keys(value).some(key => ['__proto__', 'constructor', 'prototype'].includes(key))
+  );
+}
+
+// A root default or nullable root could execute with missing input on an older
+// Dashboard, which ignores the carrier. Only object roots without defaults qualify.
+function hasRequiredNullableInput(schema: unknown): boolean {
+  if (
+    !isPlainSchemaObject(schema) ||
+    !Object.hasOwn(schema, 'type') ||
+    schema.type !== 'object' ||
+    Object.hasOwn(schema, 'default') ||
+    !Object.hasOwn(schema, 'required') ||
+    !Array.isArray(schema.required) ||
+    !Object.hasOwn(schema, 'properties') ||
+    !isPlainSchemaObject(schema.properties)
+  )
+    return false;
+
+  const properties = schema.properties;
+  if (
+    !Object.values(properties).every(
+      property =>
+        isPlainSchemaObject(property) &&
+        (!Object.hasOwn(property, 'type') ||
+          typeof property.type === 'string' ||
+          (Array.isArray(property.type) && property.type.every(type => typeof type === 'string')))
+    )
+  )
+    return false;
+  if (!schema.required.every(key => typeof key === 'string' && Object.hasOwn(properties, key)))
+    return false;
+
+  return schema.required.some(key => {
+    const type = (properties[key] as Record<string, unknown>).type;
+    if (type === 'null') return true;
+    return Array.isArray(type) && type.includes('null');
+  });
+}
+
+// The Dashboard carrier preserves JSON types and bypasses core's query coercion.
+function serializeJsonInput(input: Record<string, unknown>, schema: unknown): string {
+  const normalized = { ...input };
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value !== 'string') continue;
+    const property = propertySchema(schema, key);
+    const type = property && Object.hasOwn(property, 'type') ? property.type : undefined;
+    const types = typeof type === 'string' ? [type] : Array.isArray(type) ? type : [];
+    if (types.length === 0 || types.includes('string')) continue;
+    let converted: number | boolean | undefined;
+    for (const declared of types) {
+      if (
+        declared === 'integer' &&
+        /^-?(0|[1-9][0-9]*)$/.exec(value)?.[0] === value &&
+        Number.isSafeInteger(Number(value))
+      ) {
+        converted = Number(value);
+        break;
+      }
+      if (
+        declared === 'number' &&
+        /^-?(0|[1-9][0-9]*)(\.[0-9]+)?$/.exec(value)?.[0] === value &&
+        Number.isFinite(Number(value))
+      ) {
+        converted = Number(value);
+        break;
+      }
+      if (declared === 'boolean' && ['true', 'false', '1', '0'].includes(value)) {
+        converted = value === 'true' || value === '1';
+        break;
+      }
+    }
+    if (converted === undefined) {
+      throw McpErrorFactory.invalidParams(
+        `Invalid JSON input parameter "${sanitizeError(key)}": expected a canonical declared type`
+      );
+    }
+    normalized[key] = converted;
+  }
+  try {
+    return JSON.stringify(normalized);
+  } catch {
+    throw McpErrorFactory.invalidParams(
+      'Unsupported JSON input parameter "input": input must be JSON serializable'
+    );
+  }
 }
 
 /**
@@ -956,8 +1146,23 @@ export async function executeAbility(
   // selection and audit logging can never diverge from the gate's decision.
   const isDestructive = classifyDestructive(ability.meta?.annotations);
   const isIdempotent = ability.meta?.annotations?.idempotent ?? false;
+  const usesJsonCarrier =
+    (isReadonly || (isDestructive && isIdempotent)) &&
+    /^mainwp\/[a-z0-9-]+$/.test(ability.name) &&
+    hasRequiredNullableInput(ability.input_schema);
   const url = `${baseUrl}/abilities/${abilityName}/run`;
-  const hasInput = input && Object.keys(input).length > 0;
+  // WordPress treats an empty schema as absent and rejects non-null input for it.
+  // A top-level default needs missing GET/DELETE input; input= prevents it from applying.
+  const schema = ability.input_schema;
+  const hasInputSchema =
+    schema !== null &&
+    typeof schema === 'object' &&
+    !Array.isArray(schema) &&
+    Object.keys(schema).length > 0;
+  const hasSchemaDefault = hasInputSchema && Object.hasOwn(schema, 'default');
+  const hasInputEntries = input !== undefined && Object.keys(input).length > 0;
+  const writeOnlyRedactor = createWriteOnlyRedactor(ability.input_schema, input);
+  const safeLogger = logger ? withSecretRedaction(logger, writeOnlyRedactor.text) : undefined;
 
   /**
    * Fetch and validate response in a single operation.
@@ -973,21 +1178,48 @@ export async function executeAbility(
 
     let response: Response;
     if (isReadonly || (isDestructive && isIdempotent)) {
-      // GET or DELETE — both use query string params (WP Abilities API doesn't parse DELETE bodies)
       const method = isReadonly ? 'GET' : 'DELETE';
-      const queryString = hasInput ? serializeToPhpQueryString(input) : '';
+      let queryString: string;
+      let body: string | undefined;
+      if (usesJsonCarrier) {
+        const json = serializeJsonInput(input ?? {}, ability.input_schema);
+        if (isReadonly) {
+          if (Buffer.byteLength(json, 'utf8') > MAX_JSON_QUERY_INPUT_BYTES) {
+            throw McpErrorFactory.invalidParams(
+              `JSON input parameter "input" exceeds ${MAX_JSON_QUERY_INPUT_BYTES} bytes`
+            );
+          }
+          queryString = `?input_json=${encodeURIComponent(json)}`;
+        } else {
+          body = `{"input":${json}}`;
+          if (Buffer.byteLength(body, 'utf8') > MAX_JSON_BODY_INPUT_BYTES) {
+            throw McpErrorFactory.invalidParams(
+              `JSON input parameter "input" exceeds ${MAX_JSON_BODY_INPUT_BYTES} bytes`
+            );
+          }
+          queryString = '';
+        }
+      } else {
+        queryString =
+          serializeToPhpQueryString(input ?? {}, ability.input_schema) ||
+          (hasInputSchema && !hasSchemaDefault ? '?input=' : '');
+      }
       const fullUrl = url + queryString;
       if (fullUrl.length > MAX_URL_LENGTH) {
         throw new Error(
           `Request URL exceeds ${MAX_URL_LENGTH} characters (${fullUrl.length}); reduce input parameters`
         );
       }
-      response = await customFetch(fullUrl, { method, signal });
+      response = await customFetch(fullUrl, {
+        method,
+        ...(body === undefined ? {} : { body }),
+        signal,
+      });
     } else {
       // POST request for non-destructive write operations
       response = await customFetch(url, {
         method: 'POST',
-        body: JSON.stringify({ input: input ?? {} }),
+        body: JSON.stringify(hasInputSchema || hasInputEntries ? { input: input ?? {} } : {}),
         signal,
       });
     }
@@ -1001,13 +1233,41 @@ export async function executeAbility(
       const bodyText = await readLimitedBody(response, MAX_ERROR_BODY_BYTES);
       let errorCode = String(response.status);
       let errorMsg = response.statusText;
+      let acceptedBody = false;
+      let replacementName: unknown;
 
       // Only try to parse as JSON if the body looks like JSON
       if (bodyText.trim().startsWith('{') || bodyText.trim().startsWith('[')) {
         try {
           const errorData = JSON.parse(bodyText);
-          errorCode = (errorData as { code?: string }).code || errorCode;
-          errorMsg = (errorData as { message?: string }).message || errorMsg;
+          const { code, message } = errorData as { code?: unknown; message?: unknown };
+          errorCode = safeWpErrorCode(code) ?? errorCode;
+          errorMsg =
+            message === undefined || message === null || message === ''
+              ? errorMsg
+              : String(message);
+          if (
+            response.status >= 400 &&
+            response.status < 500 &&
+            errorData !== null &&
+            typeof errorData === 'object' &&
+            !Array.isArray(errorData) &&
+            Object.getPrototypeOf(errorData) === Object.prototype &&
+            Object.hasOwn(errorData, 'code') &&
+            safeWpErrorCode(code) !== undefined &&
+            Object.hasOwn(errorData, 'message') &&
+            typeof message === 'string' &&
+            (!Object.hasOwn(errorData, 'data') ||
+              (errorData.data !== null &&
+                typeof errorData.data === 'object' &&
+                !Array.isArray(errorData.data)))
+          ) {
+            acceptedBody = true;
+            errorMsg = message;
+            if (Object.hasOwn(errorData, 'data') && Object.hasOwn(errorData.data, 'replacement')) {
+              replacementName = errorData.data.replacement;
+            }
+          }
         } catch {
           // JSON parse failed - use raw text as message
           errorMsg = bodyText || response.statusText;
@@ -1017,23 +1277,99 @@ export async function executeAbility(
         errorMsg = bodyText;
       }
 
-      logger?.warning('Upstream request failed', {
+      safeLogger?.warning('Upstream request failed', {
         abilityName,
         httpStatus: response.status,
         upstreamLatencyMs,
       });
 
-      throw createHttpError(
-        response.status,
-        errorCode,
-        `Ability execution failed: ${errorCode} - ${sanitizeError(errorMsg)}`
+      // Credentials revoked or wrong after startup: WordPress's own text names
+      // neither the user nor where the value came from.
+      const credentialNote = (code: string): string =>
+        isCredentialRejection(response.status, code)
+          ? ` ${describeCredentialRejection(config, code)}`
+          : '';
+      const carrierNote =
+        usesJsonCarrier && response.status === 400 && errorCode === 'ability_invalid_input'
+          ? " If this Dashboard is older than MainWP Dashboard 6.2, update it: this ability's input cannot be delivered to earlier versions."
+          : '';
+
+      const upstreamCode =
+        acceptedBody &&
+        redactKnownSecrets(errorCode) === errorCode &&
+        !writeOnlyRedactor.mentions(errorCode)
+          ? errorCode
+          : undefined;
+      let replacement: string | undefined;
+      if (
+        acceptedBody &&
+        typeof replacementName === 'string' &&
+        ABILITY_NAME_RE.test(replacementName) &&
+        redactKnownSecrets(replacementName) === replacementName &&
+        !writeOnlyRedactor.mentions(replacementName)
+      ) {
+        const snapshot = abilitySnapshots.get(ability);
+        const target = snapshot && abilityIndexes.get(snapshot)?.byName.get(replacementName);
+        if (target && config.abilityNamespaces.includes(target.name.split('/')[0])) {
+          const toolName = abilityNameToToolName(target.name, config.abilityNamespaces[0]);
+          if (
+            decidePolicy(config, toolName) !== 'blocked-by-policy' &&
+            redactKnownSecrets(toolName) === toolName &&
+            !writeOnlyRedactor.mentions(toolName)
+          ) {
+            replacement = toolName;
+          }
+        }
+      }
+      const executionError = (code: string, message: string): Error =>
+        acceptedBody
+          ? new UpstreamHttpError(response.status, code, message, upstreamCode, replacement)
+          : createHttpError(response.status, code, message);
+
+      if (writeOnlyRedactor.carriesWriteOnly) {
+        // errorCode is already a plain slug or the status; drop it as well
+        // when it contains a write-only value.
+        const safeErrorCode =
+          !writeOnlyRedactor.mentions(errorCode) &&
+          (!acceptedBody || redactKnownSecrets(errorCode) === errorCode)
+            ? errorCode
+            : String(response.status);
+        // Decided on the original code, so a withheld code does not also drop
+        // the diagnosis. The note quotes the code and the configured username
+        // (escaped and cut to length), and downstream redaction is
+        // case-sensitive. A note whose text or raw username overlaps a
+        // write-only value in any case becomes a sentence that quotes nothing.
+        const note = credentialNote(errorCode);
+        const safeNote =
+          note &&
+          (writeOnlyRedactor.mentions(note) || writeOnlyRedactor.mentions(config.username ?? ''))
+            ? ' The Dashboard rejected the credentials.'
+            : note;
+        throw executionError(
+          safeErrorCode,
+          `Ability execution failed: ${safeErrorCode} (HTTP ${response.status}). The upstream message is withheld because this call carried write-only input.${safeNote}${carrierNote}`
+        );
+      }
+
+      const safeErrorCode =
+        acceptedBody && redactKnownSecrets(errorCode) !== errorCode
+          ? String(response.status)
+          : errorCode;
+      const safeMessage = acceptedBody
+        ? sanitizeError(
+            normalizeRemoteText(redactKnownSecrets(errorMsg), MAX_ERROR_BODY_BYTES, 'flatten')
+          )
+        : sanitizeError(errorMsg);
+      throw executionError(
+        safeErrorCode,
+        `Ability execution failed: ${safeErrorCode} - ${safeMessage}${credentialNote(errorCode)}${carrierNote}`
       );
     }
 
     // Read response body with streaming size enforcement
     const responseBody = await readLimitedBody(response, config.maxResponseSize);
 
-    logger?.debug('Upstream request succeeded', {
+    safeLogger?.debug('Upstream request succeeded', {
       abilityName,
       httpStatus: response.status,
       upstreamLatencyMs,
@@ -1044,7 +1380,13 @@ export async function executeAbility(
     // keys and string values at every depth — redacting the raw body text
     // instead would also replace across JSON syntax and turn a well-formed
     // response into a parse error.
-    return redactKnownSecretsDeep(JSON.parse(responseBody));
+    let parsedResponse: unknown;
+    try {
+      parsedResponse = JSON.parse(responseBody);
+    } catch {
+      throw new Error('Invalid JSON in ability response');
+    }
+    return writeOnlyRedactor.deep(redactKnownSecretsDeep(parsedResponse));
   };
 
   // Apply retry logic only for read-only operations when enabled
@@ -1055,7 +1397,7 @@ export async function executeAbility(
       baseDelay: config.retryBaseDelay,
       maxDelay: config.retryMaxDelay,
       timeoutBudget: config.requestTimeout,
-      logger,
+      logger: safeLogger,
     });
   } else {
     // No retry: execute directly with synthetic context
@@ -1067,7 +1409,7 @@ export async function executeAbility(
 
   if (isDestructive) {
     const action = input?.dry_run === true ? 'previewed' : 'executed';
-    logger?.info(`AUDIT: destructive operation ${action}`, { abilityName });
+    safeLogger?.info(`AUDIT: destructive operation ${action}`, { abilityName });
   }
 
   return result;

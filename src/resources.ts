@@ -13,6 +13,8 @@ import { Config, formatJson } from './config.js';
 import {
   fetchAbilities,
   fetchCategories,
+  getAbilityCatalogMetadata,
+  getCachedAbilityCatalogMetadata,
   executeAbility,
   getAbilityByToolName,
   type Ability,
@@ -24,6 +26,7 @@ import { abilityNameToToolName } from './naming.js';
 import { decidePolicy, classifyDestructive } from './policy.js';
 import { formatErrorResponse, getErrorMessage, McpErrorFactory } from './errors.js';
 import type { Logger } from './logging.js';
+import { maintenanceStatus, maintenanceTools } from './mrn-maintenance.js';
 
 /**
  * Response shape of a ReadResource handler.
@@ -142,16 +145,20 @@ export async function handleReadResource(
 
       try {
         const abilities = await fetchAbilities(config, true, logger); // Force refresh
+        const maintenance = maintenanceStatus(config, abilities);
         return jsonResource({
           connected: true,
           dashboardHost: redactedHost,
           abilitiesCount: abilities.length,
+          catalog: getAbilityCatalogMetadata(abilities),
           sessionData: getSessionDataUsage(config),
+          ...(maintenance ? { maintenance } : {}),
         });
       } catch (error) {
         return jsonResource({
           connected: false,
           dashboardHost: redactedHost,
+          catalog: getCachedAbilityCatalogMetadata(config),
           error: sanitizeError(getErrorMessage(error)),
         });
       }
@@ -205,7 +212,7 @@ export async function handleReadResource(
       const result = await executeAbility(
         config,
         'mainwp/get-site-v1',
-        { site_id: parsed.params.site_id },
+        { site_id_or_domain: parsed.params.site_id },
         logger,
         ability
       );
@@ -220,6 +227,14 @@ export async function handleReadResource(
       if (decidePolicy(config, toolName) !== 'allow') {
         throw McpErrorFactory.permissionDenied(`Tool is not allowed: ${toolName}`);
       }
+
+      const local = maintenanceTools(config).find(t => t.name === toolName);
+      if (local)
+        return jsonResource({
+          ...local,
+          implementation: 'local-mrn-maintenance-gate',
+          maintenance: maintenanceStatus(config, await fetchAbilities(config, false, logger)),
+        });
 
       const ability = await getAbilityByToolName(config, toolName, logger);
       if (!ability) {

@@ -11,7 +11,12 @@ import type { TextContent } from '@modelcontextprotocol/sdk/types.js';
 import { configIdentityHash, executeAbility, type Ability } from './abilities.js';
 import { Config, formatJson } from './config.js';
 import type { Logger } from './logging.js';
-import { declaresUsableBooleanParam } from './policy.js';
+import {
+  declaresUsableBooleanParam,
+  declaresNullablePreviewToken,
+  requiresUsableFalseParam,
+  resolveConfirmationParam,
+} from './policy.js';
 import { trackSessionData } from './session.js';
 import {
   buildConfirmationUnsupportedResponse,
@@ -26,9 +31,13 @@ import {
 
 /**
  * Preview tracking for two-phase confirmation flow.
- * Maps preview keys to timestamps for validation and expiry.
+ * Maps preview keys to the time the preview was made, for validation and
+ * expiry. `upstreamToken` holds the `preview_token` an ability's own dry run
+ * issued, so the confirmed call can supply it when the caller sends none. It
+ * shares the entry's key, identity scope and expiry, and goes when the entry
+ * is consumed.
  */
-const pendingPreviews = new Map<string, number>();
+const pendingPreviews = new Map<string, { ts: number; upstreamToken?: string }>();
 
 /**
  * Token index for confirmation flow.
@@ -49,6 +58,14 @@ const MAX_PENDING_PREVIEWS = 100;
 export function clearPendingPreviews(): void {
   pendingPreviews.clear();
   tokenIndex.clear();
+}
+
+/**
+ * Sizes of the two preview maps (for testing only).
+ * @internal
+ */
+export function getPendingPreviewCounts(): { previews: number; tokens: number } {
+  return { previews: pendingPreviews.size, tokens: tokenIndex.size };
 }
 
 /**
@@ -108,22 +125,100 @@ function canonicalize(value: unknown): unknown {
 
 /**
  * Generate a unique preview key for a tool call.
- * Excludes confirmation-related parameters (confirm, user_confirmed, dry_run)
- * from the key to ensure preview and execution calls match.
+ * Excludes confirmation-related parameters (confirm, the resolved confirm_*,
+ * user_confirmed, dry_run) from the key to ensure preview and execution calls match.
+ * With `usesPreviewToken`, `preview_token` is left out as well: the ability
+ * issues it in its own dry run, so it is null on the preview and a string on
+ * the confirmed call. Eligible MainWP updates bind it when MainWP is primary;
+ * other abilities let the Dashboard validate the caller's token.
  * Prefixed with the config identity hash: the preview maps are module-level,
  * so without the scope a token issued against one dashboard/principal could
  * confirm the same tool and arguments against another createServer(config)
  * instance in the same process.
+ * The arguments enter the key as a digest: MAX_PENDING_PREVIEWS counts
+ * entries, not bytes, and a tool may declare room for megabytes per string.
+ * @internal exported for tests
  */
-function getPreviewKey(scope: string, toolName: string, args: Record<string, unknown>): string {
-  const {
-    confirm: _confirm,
-    user_confirmed: _user_confirmed,
-    dry_run: _dry_run,
-    confirmation_token: _confirmation_token,
-    ...relevantArgs
-  } = args;
-  return `${scope}:${toolName}:${JSON.stringify(canonicalize(relevantArgs))}`;
+export function getPreviewKey(
+  scope: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  confirmationParam: string,
+  usesPreviewToken = false
+): string {
+  const relevantArgs = { ...args };
+  delete relevantArgs.confirm;
+  delete relevantArgs.user_confirmed;
+  delete relevantArgs.dry_run;
+  delete relevantArgs.confirmation_token;
+  delete relevantArgs[confirmationParam];
+  if (usesPreviewToken) delete relevantArgs.preview_token;
+  const digest = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(canonicalize(relevantArgs)))
+    .digest('hex');
+  return `${scope}:${toolName}:${digest}`;
+}
+
+/**
+ * Read the `preview_token` an ability's dry run issued, or undefined when the
+ * response carries none worth sending back. The response is remote input that
+ * has already been through secret redaction, so only an own top-level string
+ * in a narrow opaque-token shape is accepted. A redaction marker falls outside
+ * the character set and is dropped like any other malformed value. A dropped
+ * value is not an error: the caller can still relay the token itself.
+ * @internal exported for tests
+ */
+export function capturePreviewToken(
+  result: unknown,
+  tokenSchema: Record<string, unknown>
+): string | undefined {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return undefined;
+  if (!Object.hasOwn(result, 'preview_token')) return undefined;
+  const token = (result as Record<string, unknown>).preview_token;
+  if (
+    typeof token !== 'string' ||
+    token.length < 16 ||
+    token.length > 256 ||
+    !/^[A-Za-z0-9._~-]+$/.test(token)
+  ) {
+    return undefined;
+  }
+  for (const bound of ['minLength', 'maxLength'] as const) {
+    if (!Object.hasOwn(tokenSchema, bound)) continue;
+    const limit = tokenSchema[bound];
+    if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 0) continue;
+    if (bound === 'minLength' ? token.length < limit : token.length > limit) return undefined;
+  }
+  return token;
+}
+
+const BOUND_PREVIEW_TOKEN_ABILITIES = [
+  'mainwp/run-updates-v1',
+  'mainwp/update-all-v1',
+  'mainwp/update-site-core-v1',
+  'mainwp/update-site-plugins-v1',
+  'mainwp/update-site-themes-v1',
+  'mainwp/update-site-translations-v1',
+];
+
+/**
+ * Whether the confirmed call always sends the token captured from this
+ * ability's preview. Only these MainWP updates bind it; other abilities let a
+ * caller's own token win, so their preview's token may never go out.
+ */
+function bindsPreviewToken(
+  config: Config,
+  ability: Ability,
+  usesPreviewToken: boolean,
+  upstreamToken: string | undefined
+): boolean {
+  return (
+    usesPreviewToken &&
+    typeof upstreamToken === 'string' &&
+    config.abilityNamespaces[0] === 'mainwp' &&
+    BOUND_PREVIEW_TOKEN_ABILITIES.includes(ability.name)
+  );
 }
 
 /**
@@ -133,19 +228,18 @@ function cleanupExpiredPreviews(): void {
   const now = Date.now();
 
   // First pass: Remove expired entries
-  for (const [key, timestamp] of pendingPreviews.entries()) {
-    if (now - timestamp > PREVIEW_EXPIRY_MS) {
+  for (const [key, entry] of pendingPreviews.entries()) {
+    if (now - entry.ts > PREVIEW_EXPIRY_MS) {
       pendingPreviews.delete(key);
     }
   }
 
-  // Second pass: Enforce max size limit by removing oldest entries
-  if (pendingPreviews.size > MAX_PENDING_PREVIEWS) {
-    const sortedEntries = Array.from(pendingPreviews.entries()).sort((a, b) => a[1] - b[1]);
-    const toRemove = sortedEntries.slice(0, pendingPreviews.size - MAX_PENDING_PREVIEWS);
-    for (const [key] of toRemove) {
-      pendingPreviews.delete(key);
-    }
+  // Second pass: Enforce the cap, oldest publication first. Map order is
+  // publication order because a repeat preview re-inserts its key, and unlike
+  // `ts` it still separates previews made in the same millisecond.
+  for (const key of pendingPreviews.keys()) {
+    if (pendingPreviews.size <= MAX_PENDING_PREVIEWS) break;
+    pendingPreviews.delete(key);
   }
 
   // Third pass: Clean up orphaned tokens whose preview keys no longer exist
@@ -168,15 +262,21 @@ export async function handleConfirmationFlow(
   params: ConfirmationFlowParams
 ): Promise<ConfirmationResult> {
   const { config, ability, toolName, abilityName, args, effectiveArgs, logger, signal } = params;
-  const ctx: ConfirmationContext = { tool: toolName, ability: abilityName };
-
   // Check if tool supports confirmation parameter. Usable means the declared
   // subschema can accept the literal `true` we send — a `confirm: false` or
   // `confirm: {type: "string"}` declaration has no working channel and takes
   // the same fail-closed path as an absent key.
   const schemaProps = ability.input_schema?.properties;
-  const hasConfirmParam = declaresUsableBooleanParam(schemaProps, 'confirm');
-  const hasDryRunParam = declaresUsableBooleanParam(schemaProps, 'dry_run');
+  const confirmationParam = resolveConfirmationParam(ability.input_schema);
+  const ctx: ConfirmationContext = {
+    tool: toolName,
+    ability: abilityName,
+    confirmationParam,
+  };
+  const hasConfirmParam = confirmationParam !== undefined;
+  const canPreview =
+    confirmationParam === 'confirm' && declaresUsableBooleanParam(schemaProps, 'dry_run');
+  const usesPreviewToken = canPreview && declaresNullablePreviewToken(schemaProps);
 
   // Fail closed: a destructive ability that declares no confirm parameter has
   // no confirmation channel, so while confirmation is required it can never
@@ -198,7 +298,7 @@ export async function handleConfirmationFlow(
   }
 
   // Validation: Conflicting parameters (user_confirmed + dry_run)
-  if (args.user_confirmed === true && args.dry_run === true) {
+  if (confirmationParam === 'confirm' && args.user_confirmed === true && args.dry_run === true) {
     logger.warning('Conflicting parameters: user_confirmed and dry_run both set', {
       toolName,
       abilityName,
@@ -214,13 +314,12 @@ export async function handleConfirmationFlow(
     };
   }
 
-  // Case 1: Explicit dry_run bypass - skip confirmation flow entirely.
-  // Only honored when the ability declares dry_run: forwarding a fabricated
-  // dry_run (possibly alongside confirm: true) would execute for real if
-  // upstream ignores unknown input, so undeclared dry_run is rejected
-  // before any upstream call.
+  // Case 1: Explicit dry_run bypass for conventional confirm abilities.
+  // A named confirm_* must stay true in upstream input, so it cannot be
+  // removed for dry_run. Undeclared dry_run is also rejected before any
+  // upstream call.
   if (args.dry_run === true) {
-    if (!hasDryRunParam) {
+    if (!canPreview) {
       logger.warning('Invalid parameter: dry_run on tool without dry_run support', {
         toolName,
         abilityName,
@@ -234,27 +333,47 @@ export async function handleConfirmationFlow(
       };
     }
     logger.debug('Explicit dry_run bypasses confirmation flow', { toolName });
-    // Strip confirm so upstream never sees the ambiguous confirm+dry_run
-    // combination — mirrors the Case 2 preview call, which sends dry_run
-    // with confirm removed.
-    const { confirm: _dryRunConfirm, ...dryRunArgs } = effectiveArgs;
+    // An ability that requires confirm gets an explicit false. Optional keys
+    // stay absent, see requiresUsableFalseParam.
+    const dryRunArgs = { ...effectiveArgs };
+    delete dryRunArgs.confirm;
+    delete dryRunArgs[confirmationParam!];
+    if (requiresUsableFalseParam(ability.input_schema, 'confirm')) {
+      dryRunArgs.confirm = false;
+    }
     return { action: 'execute', effectiveArgs: dryRunArgs };
   }
 
   // Case 2: Preview request (confirm: true without user_confirmed)
-  if (args.confirm === true && args.user_confirmed !== true) {
-    cleanupExpiredPreviews();
-
-    // Abilities without a declared dry_run parameter get no upstream preview
-    // call — fabricating dry_run against a schema that doesn't declare it
-    // could execute for real if upstream ignores unknown input. The two-phase
-    // gate still applies: a token is issued below so the confirmed follow-up
-    // call can proceed.
+  if (args[confirmationParam!] === true && args.user_confirmed !== true) {
+    // Only conventional confirm abilities with declared dry_run get an
+    // upstream preview. Named confirm_* fields must stay true in input, so
+    // they use the token-only path even if dry_run is declared.
     let previewResult: unknown = null;
-    if (hasDryRunParam) {
-      // Execute preview with dry_run: true and the confirm flag removed
+    let upstreamToken: string | undefined;
+    if (canPreview) {
+      // An ability that requires confirm gets an explicit false. Optional keys
+      // stay absent, see requiresUsableFalseParam.
       const previewArgs: Record<string, unknown> = { ...effectiveArgs, dry_run: true };
-      delete previewArgs.confirm;
+      delete previewArgs[confirmationParam!];
+      if (requiresUsableFalseParam(ability.input_schema, 'confirm')) {
+        previewArgs.confirm = false;
+      }
+      // The dry run issues the token and rejects a call that already carries
+      // one, so the caller's value never goes out on the preview. Required
+      // keys get an explicit null and optional keys stay absent, as above.
+      if (usesPreviewToken) {
+        const schema = ability.input_schema!;
+        if (
+          Object.hasOwn(schema, 'required') &&
+          Array.isArray(schema.required) &&
+          schema.required.includes('preview_token')
+        ) {
+          previewArgs.preview_token = null;
+        } else {
+          delete previewArgs.preview_token;
+        }
+      }
       previewResult = await executeAbility(
         config,
         abilityName,
@@ -263,42 +382,74 @@ export async function handleConfirmationFlow(
         ability,
         signal
       );
+      if (usesPreviewToken) {
+        upstreamToken = capturePreviewToken(
+          previewResult,
+          (schemaProps as Record<string, Record<string, unknown>>).preview_token
+        );
+      }
     } else {
-      logger.warning('Preview unavailable - ability does not support dry_run', {
-        toolName,
-        abilityName,
-      });
+      logger.warning(
+        confirmationParam === 'confirm'
+          ? 'Preview unavailable - ability does not support dry_run'
+          : 'Preview unavailable for named confirmation parameter',
+        {
+          toolName,
+          abilityName,
+        }
+      );
     }
 
-    // Store preview for later validation
-    const previewKey = getPreviewKey(configIdentityHash(config), toolName, args);
-    pendingPreviews.set(previewKey, Date.now());
+    const previewKey = getPreviewKey(
+      configIdentityHash(config),
+      toolName,
+      args,
+      confirmationParam!,
+      usesPreviewToken
+    );
+    const token = crypto.randomUUID();
+    // The Dashboard pins the previewed versions only through a token the
+    // confirmed call is sure to send.
+    const confirmationResponse = canPreview
+      ? buildConfirmationRequiredResponse(
+          ctx,
+          previewResult,
+          token,
+          bindsPreviewToken(config, ability, usesPreviewToken, upstreamToken)
+        )
+      : buildNoPreviewAvailableResponse(ctx, token);
+    const previewResponse = formatJson(config, confirmationResponse);
 
-    // Clean up any existing token for this preview key before generating a new one
+    // Accounting runs before anything is recorded. When it throws, the caller
+    // never receives this response, so both maps stay as they were and an
+    // earlier preview of the same key keeps its token.
+    trackSessionData(previewResponse, config, logger, 'during preview');
+
+    // Delete first: Map.set on an existing key keeps its old position, and
+    // the cap evicts in Map order.
+    pendingPreviews.delete(previewKey);
+    pendingPreviews.set(previewKey, {
+      ts: Date.now(),
+      ...(upstreamToken === undefined ? {} : { upstreamToken }),
+    });
+
+    // The new token replaces any earlier one for this preview key
     for (const [existingToken, existingKey] of tokenIndex.entries()) {
       if (existingKey === previewKey) {
         tokenIndex.delete(existingToken);
         break;
       }
     }
-
-    // Generate confirmation token for secure token-based confirmation
-    const token = crypto.randomUUID();
     tokenIndex.set(token, previewKey);
 
+    // Runs after the insert so the cap holds on return. The entry just
+    // recorded is last in Map order and survives.
+    cleanupExpiredPreviews();
+
     logger.info(
-      hasDryRunParam
-        ? 'Preview generated for confirmation'
-        : 'Confirmation required without preview',
+      canPreview ? 'Preview generated for confirmation' : 'Confirmation required without preview',
       { toolName }
     );
-
-    const confirmationResponse = hasDryRunParam
-      ? buildConfirmationRequiredResponse(ctx, previewResult, token)
-      : buildNoPreviewAvailableResponse(ctx, token);
-    const previewResponse = formatJson(config, confirmationResponse);
-
-    trackSessionData(previewResponse, config, logger, 'during preview');
 
     return {
       action: 'respond',
@@ -309,7 +460,7 @@ export async function handleConfirmationFlow(
   // Case 3: Confirmed execution (user_confirmed: true)
   if (args.user_confirmed === true) {
     // Warning: Ambiguous parameters (confirm + user_confirmed both set)
-    if (args.confirm === true) {
+    if (args[confirmationParam!] === true) {
       logger.warning(
         'Ambiguous parameters: both confirm and user_confirmed set, treating as confirmation',
         { toolName, abilityName }
@@ -365,7 +516,13 @@ export async function handleConfirmationFlow(
       };
     }
     // Verify token matches current arguments (prevent arg-swap)
-    const currentPreviewKey = getPreviewKey(configIdentityHash(config), toolName, args);
+    const currentPreviewKey = getPreviewKey(
+      configIdentityHash(config),
+      toolName,
+      args,
+      confirmationParam!,
+      usesPreviewToken
+    );
     if (currentPreviewKey !== tokenPreviewKey) {
       tokenIndex.delete(confirmationToken);
       logger.warning('Confirmation failed - arguments do not match preview', { toolName });
@@ -378,9 +535,9 @@ export async function handleConfirmationFlow(
     const previewKey = tokenPreviewKey;
 
     // Check preview expiry BEFORE running cleanup for more helpful error messages
-    const previewTimestamp = pendingPreviews.get(previewKey);
+    const previewEntry = pendingPreviews.get(previewKey);
 
-    if (previewTimestamp === undefined) {
+    if (previewEntry === undefined) {
       logger.warning('Confirmation failed - no preview found', { toolName });
       return {
         action: 'respond',
@@ -389,7 +546,7 @@ export async function handleConfirmationFlow(
       };
     }
 
-    if (Date.now() - previewTimestamp > PREVIEW_EXPIRY_MS) {
+    if (Date.now() - previewEntry.ts > PREVIEW_EXPIRY_MS) {
       pendingPreviews.delete(previewKey);
       tokenIndex.delete(confirmationToken);
       logger.warning('Confirmation failed - preview expired', { toolName });
@@ -400,22 +557,72 @@ export async function handleConfirmationFlow(
       };
     }
 
-    // Preview is valid - proceed with execution
+    // Consume the confirmation even when the upstream token does not match.
+    const upstreamToken = previewEntry.upstreamToken;
     pendingPreviews.delete(previewKey);
     tokenIndex.delete(confirmationToken);
-    const previewAge = Date.now() - previewTimestamp;
+    const bindPreviewToken = bindsPreviewToken(config, ability, usesPreviewToken, upstreamToken);
+    if (
+      bindPreviewToken &&
+      effectiveArgs.preview_token !== null &&
+      effectiveArgs.preview_token !== undefined &&
+      effectiveArgs.preview_token !== upstreamToken
+    ) {
+      logger.warning('Confirmation failed - preview token does not match preview', { toolName });
+      return {
+        action: 'respond',
+        response: [
+          {
+            type: 'text',
+            text: formatJson(
+              config,
+              buildPreviewRequiredResponse(
+                ctx,
+                'The preview token does not match this preview. Generate a new preview before confirming.'
+              )
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const previewAge = Date.now() - previewEntry.ts;
     logger.info('User confirmation validated', { toolName, previewAge });
 
-    // Remove user_confirmed and confirmation_token flags, keep confirm: true for the actual execution
+    // Confirmation credentials belong to this server, not the upstream ability.
+    // Drop dry_run too: the preview key ignores it, so the token also binds a
+    // call carrying one, and a string "true" forwarded here would make the
+    // approved execution a preview on a Dashboard that reads it as a boolean.
     const {
       user_confirmed: _user_confirmed,
       confirmation_token: _confirmation_token,
+      dry_run: _confirmedDryRun,
       ...confirmedArgs
     } = effectiveArgs;
+    delete confirmedArgs.confirm;
+    delete confirmedArgs[confirmationParam!];
+    // Other abilities keep caller-wins for tokens from a later dry run.
+    if (
+      usesPreviewToken &&
+      (bindPreviewToken ||
+        confirmedArgs.preview_token === null ||
+        confirmedArgs.preview_token === undefined) &&
+      upstreamToken !== undefined
+    ) {
+      confirmedArgs.preview_token = upstreamToken;
+    }
+    if (
+      confirmationParam === 'confirm' &&
+      requiresUsableFalseParam(ability.input_schema, 'dry_run')
+    ) {
+      // An ability that requires dry_run gets an explicit false. Optional keys
+      // stay absent, see requiresUsableFalseParam.
+      confirmedArgs.dry_run = false;
+    }
 
     return {
       action: 'execute',
-      effectiveArgs: { ...confirmedArgs, confirm: true },
+      effectiveArgs: { ...confirmedArgs, [confirmationParam!]: true },
     };
   }
 
@@ -433,7 +640,7 @@ export async function handleConfirmationFlow(
           config,
           buildPreviewRequiredResponse(
             ctx,
-            'Destructive tools require confirmation parameters; neither confirm nor user_confirmed was provided'
+            `Destructive tools require confirmation parameters; neither ${confirmationParam} nor user_confirmed was provided`
           )
         ),
       },

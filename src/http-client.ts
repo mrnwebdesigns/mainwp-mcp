@@ -7,6 +7,7 @@
 
 import { Agent as UndiciAgent } from 'undici';
 import { Config, getAuthHeaders } from './config.js';
+import { safeWpErrorCode } from './credential-diagnostics.js';
 import { createHttpError } from './errors.js';
 import { sanitizeError } from './security.js';
 import type { Logger } from './logging.js';
@@ -18,7 +19,19 @@ export const MAX_ERROR_BODY_BYTES = 65536;
 export const MAX_URL_LENGTH = 8000;
 
 /** Maximum number of pages to fetch during pagination — prevents unbounded requests */
-const MAX_PAGES = 50;
+export const MAX_PAGES = 50;
+
+const PER_PAGE = 100;
+
+export interface PaginationMetadata {
+  truncated: boolean;
+  pagesFetched: number;
+  pageLimit: number;
+}
+
+export interface PaginatedResult<T> extends PaginationMetadata {
+  items: T[];
+}
 
 interface ResponseDeadline {
   timeoutId?: ReturnType<typeof setTimeout>;
@@ -41,9 +54,22 @@ function clearResponseDeadline(deadline: ResponseDeadline): void {
 }
 
 function createTimeoutError(deadline: Pick<ResponseDeadline, 'effectiveTimeout' | 'url'>): Error {
-  const error = new Error(`Request timeout after ${deadline.effectiveTimeout}ms: ${deadline.url}`);
+  // No query string in the message: GET and DELETE ability calls carry their
+  // input there, including writeOnly values in percent-encoded form.
+  const error = new Error(
+    `Request timeout after ${deadline.effectiveTimeout}ms: ${deadline.url.split('?')[0]}`
+  );
   (error as Error & { code: string }).code = 'ETIMEDOUT';
   return error;
+}
+
+// Node quotes the request URL in some transport errors (an unparseable URL,
+// for one). Same reason as the timeout message: the query string carries GET
+// and DELETE input.
+function dropQueryFromError(error: unknown, url: string): void {
+  if (error instanceof Error && url.includes('?') && error.message.includes(url)) {
+    error.message = error.message.split(url).join(url.split('?')[0]);
+  }
 }
 
 /**
@@ -119,7 +145,13 @@ export function createFetch(config: Config, perCallTimeout?: number) {
         fetchOptions.dispatcher = getUnsafeDispatcher();
       }
 
-      const response = await fetch(url, fetchOptions as RequestInit);
+      let response: Response;
+      try {
+        response = await fetch(url, fetchOptions as RequestInit);
+      } catch (error) {
+        dropQueryFromError(error, url);
+        throw error;
+      }
 
       // Fail closed on redirects instead of following the Location header.
       // With `redirect: 'manual'`, fetch surfaces the 3xx response instead of
@@ -220,6 +252,9 @@ export async function readLimitedBody(response: Response, maxBytes: number): Pro
     if (deadline?.timedOut) {
       throw createTimeoutError(deadline);
     }
+    if (deadline) {
+      dropQueryFromError(error, deadline.url);
+    }
     throw error;
   } finally {
     if (deadline) {
@@ -227,6 +262,19 @@ export async function readLimitedBody(response: Response, maxBytes: number): Pro
       responseDeadlines.delete(response);
     }
   }
+}
+
+/** The `code` of a WordPress REST error body, if it is a plain slug. */
+function wpErrorCode(body: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return safeWpErrorCode((parsed as { code?: unknown }).code);
+    }
+  } catch {
+    // Not JSON: fall back to the status code.
+  }
+  return undefined;
 }
 
 /**
@@ -239,19 +287,26 @@ export async function paginateApi<T>(
   label: string,
   maxResponseSize: number,
   logger?: Logger
-): Promise<T[]> {
+): Promise<PaginatedResult<T>> {
   let page = 1;
   let capped = false;
+  // The truncated flag must not read "complete" unless the headers say so: a
+  // total advertised on an earlier page, a total that is not a plain digit
+  // string, or a full page with no total at all means pages may remain even
+  // where the loop stopped early.
+  let advertisedPages = 0;
+  let uncertainTotal = false;
   const allItems: T[] = [];
 
   while (true) {
-    const response = await customFetch(`${endpoint}?per_page=100&page=${page}`);
+    const response = await customFetch(`${endpoint}?per_page=${PER_PAGE}&page=${page}`);
 
     if (!response.ok) {
       const errorText = await readLimitedBody(response, MAX_ERROR_BODY_BYTES);
       throw createHttpError(
         response.status,
-        String(response.status),
+        // WordPress's error code tells a wrong username from a wrong password.
+        wpErrorCode(errorText) ?? String(response.status),
         `Failed to fetch ${label}: ${response.status} ${response.statusText} - ${sanitizeError(errorText)}`
       );
     }
@@ -266,7 +321,19 @@ export async function paginateApi<T>(
     const batch = parsed as T[];
     allItems.push(...batch);
 
-    const totalPages = parseInt(response.headers.get('X-WP-TotalPages') || '1', 10);
+    const totalHeader = response.headers.get('X-WP-TotalPages');
+    if (totalHeader === null) {
+      // A missing total ends the loop on this page, so a full one may not be the last.
+      if (batch.length >= PER_PAGE) uncertainTotal = true;
+    } else if (/^\d+$/.test(totalHeader)) {
+      // A shrink can land on the current page and stop the loop with nothing
+      // left over, so the page count alone would read as complete.
+      if (Number(totalHeader) < advertisedPages) uncertainTotal = true;
+      advertisedPages = Math.max(advertisedPages, Number(totalHeader));
+    } else {
+      uncertainTotal = true;
+    }
+    const totalPages = parseInt(totalHeader || '1', 10);
     if (page >= totalPages) break;
     if (page >= MAX_PAGES) {
       capped = true;
@@ -283,5 +350,10 @@ export async function paginateApi<T>(
     logger?.info(`Fetched ${allItems.length} ${label} across ${page} pages`);
   }
 
-  return allItems;
+  return {
+    items: allItems,
+    truncated: capped || uncertainTotal || advertisedPages > page,
+    pagesFetched: page,
+    pageLimit: MAX_PAGES,
+  };
 }

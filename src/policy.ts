@@ -84,19 +84,23 @@ export function isToolAllowed(config: PolicyGateConfig, toolName: string): boole
 
 /**
  * Whether an ability's input-schema properties declare a parameter that can
- * actually accept the literal `true` this server sends for it (confirm,
- * dry_run). Presence alone is not capability: a `false` boolean subschema or
- * `{type: "string"}` provably rejects `true`, so the declared channel is
- * unusable and callers must treat it exactly like an absent key (fail closed
- * for confirm, reject fabricated dry_run). Deliberately permissive otherwise —
- * `{}`, a description-only subschema, or a missing `type` all accept `true`,
- * and rejecting those would break legitimately sloppy abilities.
+ * accept the requested boolean literal (true by default). Presence alone is
+ * not capability: a `false` boolean subschema or `{type: "string"}` rejects
+ * both literals, so the declared channel is unusable and callers must treat it
+ * exactly like an absent key (fail closed for confirm, reject fabricated
+ * dry_run). Deliberately permissive otherwise: `{}`, a description-only
+ * subschema, or a missing `type` accept either literal, and rejecting those
+ * would break abilities with loosely written schemas.
  *
  * Takes the RAW fetched properties, not a presentation-coerced copy: tool
  * conversion rewrites non-object property values to `{}`, which would make an
  * unusable channel look usable and split discovery from execution.
  */
-export function declaresUsableBooleanParam(properties: unknown, name: string): boolean {
+export function declaresUsableBooleanParam(
+  properties: unknown,
+  name: string,
+  value: boolean = true
+): boolean {
   if (properties === null || typeof properties !== 'object' || Array.isArray(properties)) {
     return false;
   }
@@ -109,7 +113,94 @@ export function declaresUsableBooleanParam(properties: unknown, name: string): b
   const type: unknown = schema.type;
   if (typeof type === 'string' && type !== 'boolean') return false;
   if (Array.isArray(type) && !type.includes('boolean')) return false;
-  if (Array.isArray(schema.enum) && !schema.enum.includes(true)) return false;
-  if (Object.hasOwn(schema, 'const') && schema.const !== true) return false;
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) return false;
+  if (Object.hasOwn(schema, 'const') && schema.const !== value) return false;
   return true;
+}
+
+/**
+ * Whether the confirmation flow should send an explicit `false` for this key.
+ * Only required keys qualify: an ability that requires the key already rejects
+ * a call without it, so sending `false` cannot break a call that worked before.
+ * Optional keys stay absent because GET and DELETE abilities take query-string
+ * input, where a boolean travels as a string (`0` or `false`, depending on the
+ * schema) and WordPress versions before 7.1 pass that string to the ability
+ * without converting it back to a boolean.
+ */
+export function requiresUsableFalseParam(schema: unknown, name: string): boolean {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  if (!Object.hasOwn(schema, 'required')) return false;
+  const record = schema as Record<string, unknown>;
+  return (
+    Array.isArray(record.required) &&
+    record.required.includes(name) &&
+    declaresUsableBooleanParam(record.properties, name, false)
+  );
+}
+
+/**
+ * Whether an ability declares `preview_token` as a string that may also be
+ * null. That shape marks an ability whose own dry run issues the token: null
+ * on the dry run, the issued string on the confirmed call. Only an explicit
+ * type list with both members qualifies. A plain `string` declaration takes
+ * its token from a separate preview ability, and a missing or looser type
+ * says nothing about the contract, so both keep the caller's value untouched.
+ */
+export function declaresNullablePreviewToken(properties: unknown): boolean {
+  if (properties === null || typeof properties !== 'object' || Array.isArray(properties)) {
+    return false;
+  }
+  if (!Object.hasOwn(properties, 'preview_token')) return false;
+  const sub = (properties as Record<string, unknown>).preview_token;
+  if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) return false;
+  if (!Object.hasOwn(sub, 'type')) return false;
+  const type = (sub as Record<string, unknown>).type;
+  return Array.isArray(type) && type.includes('string') && type.includes('null');
+}
+
+/**
+ * List the required `confirm_*` properties whose schema pins them to literal
+ * true with `const: true` or `enum: [true]`. Requiring both the naming
+ * convention and membership in `required` avoids treating an optional domain
+ * boolean as an execution-control channel; pinning it excludes domain flags
+ * that also accept false.
+ */
+export function pinnedConfirmationParams(schema: unknown): string[] {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return [];
+  const record = schema as Record<string, unknown>;
+  const properties = record.properties;
+  if (properties === null || typeof properties !== 'object' || Array.isArray(properties)) {
+    return [];
+  }
+  const required = Array.isArray(record.required) ? record.required : [];
+  return required.filter((name): name is string => {
+    if (
+      typeof name !== 'string' ||
+      !/^confirm_[a-z0-9_]+$/.test(name) ||
+      !declaresUsableBooleanParam(properties, name)
+    ) {
+      return false;
+    }
+    const property = (properties as Record<string, Record<string, unknown>>)[name];
+    return (
+      property.const === true ||
+      (Array.isArray(property.enum) && property.enum.length === 1 && property.enum[0] === true)
+    );
+  });
+}
+
+/**
+ * Resolve the one input property that carries trusted confirmation: the
+ * conventional `confirm`, or else exactly one pinned `confirm_*` (see
+ * pinnedConfirmationParams). Ambiguity fails closed, including `confirm`
+ * next to a pinned `confirm_*`: removing only `confirm` from a preview
+ * would still send the pinned field as true.
+ */
+export function resolveConfirmationParam(schema: unknown): string | undefined {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return undefined;
+  const pinned = pinnedConfirmationParams(schema);
+  if (declaresUsableBooleanParam((schema as Record<string, unknown>).properties, 'confirm')) {
+    return pinned.length === 0 ? 'confirm' : undefined;
+  }
+  return pinned.length === 1 ? pinned[0] : undefined;
 }

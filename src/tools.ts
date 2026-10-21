@@ -16,8 +16,14 @@ import {
 } from './abilities.js';
 import { Config, formatJson } from './config.js';
 import { validateInput, sanitizeError } from './security.js';
-import { McpErrorFactory, formatErrorResponse, getErrorMessage } from './errors.js';
-import { Logger, withRequestId } from './logging.js';
+import {
+  MCP_ERROR_CODES,
+  McpError,
+  McpErrorFactory,
+  formatErrorResponse,
+  getErrorMessage,
+} from './errors.js';
+import { Logger, withRequestId, withSecretRedaction } from './logging.js';
 import {
   trackSessionData,
   getSessionDataUsage,
@@ -26,8 +32,21 @@ import {
 } from './session.js';
 import { abilityToTool } from './tool-schema.js';
 import { handleConfirmationFlow } from './confirmation.js';
-import { decidePolicy, classifyDestructive, isToolAllowed } from './policy.js';
+import {
+  decidePolicy,
+  classifyDestructive,
+  isToolAllowed,
+  pinnedConfirmationParams,
+  resolveConfirmationParam,
+} from './policy.js';
 import { buildSafeModeBlockedResponse, buildNoChangeResponse } from './confirmation-responses.js';
+import { createWriteOnlyRedactor, type WriteOnlyRedactor } from './write-only.js';
+import {
+  maintenanceTools,
+  MAINTENANCE_TOOLS,
+  executeMaintenance,
+  observeMaintenanceReceipt,
+} from './mrn-maintenance.js';
 
 /**
  * Options for tool execution
@@ -121,6 +140,11 @@ export async function getTools(config: Config, logger?: Logger): Promise<Tool[]>
 
   // Apply allowlist filter (whitelist)
   tools = tools.filter(tool => isToolAllowed(config, tool.name));
+  const localTools = maintenanceTools(config);
+  if (localTools.some(local => tools.some(remote => remote.name === local.name))) {
+    throw McpErrorFactory.permissionDenied('MRN local maintenance tool name collision');
+  }
+  tools.push(...localTools);
 
   // Log if tools were filtered
   if (tools.length !== originalCount && logger) {
@@ -165,6 +189,8 @@ export async function executeTool(
   // Create a child logger that includes requestId in every log entry
   // for end-to-end tracing of this tool call through retry and API execution
   const reqLogger = withRequestId(logger, requestId);
+  let callLogger = reqLogger;
+  let writeOnlyRedactor: WriteOnlyRedactor | undefined;
 
   // SECURITY: Only log metadata (toolName, hasArguments boolean), never log actual
   // argument values or response content as they may contain sensitive data.
@@ -185,6 +211,30 @@ export async function executeTool(
       throw McpErrorFactory.permissionDenied(`Tool is not allowed: ${toolName}`);
     }
 
+    if ((MAINTENANCE_TOOLS as readonly string[]).includes(toolName)) {
+      const result = await executeMaintenance(config, toolName, args, reqLogger, options?.signal);
+      const text = formatJson(config, result);
+      try {
+        trackSessionData(text, config, reqLogger, 'for MRN maintenance response');
+      } catch (error) {
+        if (args.user_confirmed === true) {
+          throw McpErrorFactory.resourceExhausted(
+            'The maintenance result exceeded the session limit. Inspect provider operation state before retrying.',
+            { execution_attempted: true, result_omitted: true }
+          );
+        }
+        throw error;
+      }
+      return {
+        content: [{ type: 'text', text }],
+        ...(['OUTCOME_UNKNOWN', 'READBACK_REQUIRED', 'PARTIAL_OR_UNVERIFIED'].includes(
+          String(result.status)
+        )
+          ? { isError: true }
+          : {}),
+      };
+    }
+
     // Resolve tool name → ability via the cache reverse index built during
     // fetchAbilities. This handles both primary-namespace (unprefixed) tools
     // and prefixed `{ns}__tool` names from non-primary namespaces.
@@ -194,10 +244,12 @@ export async function executeTool(
     }
     abilityName = ability.name;
 
-    // Validate against the resolved ability contract before confirmation or
-    // execution. Schema-declared string limits may exceed the conservative
-    // connector default, but validateInput still enforces an absolute cap.
+    // Validate against the schema of this same ability object, which is what
+    // executeAbility runs below, so the declared limits and the executed
+    // ability cannot come from different fetches.
     validateInput(args, ability.input_schema);
+    writeOnlyRedactor = createWriteOnlyRedactor(ability.input_schema, args);
+    callLogger = withSecretRedaction(reqLogger, writeOnlyRedactor.text);
 
     const ctx = { tool: toolName, ability: abilityName };
 
@@ -209,7 +261,7 @@ export async function executeTool(
     // Always warn when annotations are missing — abilities without annotations
     // are treated as destructive and require confirmation as a safety default
     if (!annotations || typeof annotations.destructive !== 'boolean') {
-      reqLogger.warning('Ability missing destructive annotation, defaulting to destructive', {
+      callLogger.warning('Ability missing destructive annotation, defaulting to destructive', {
         toolName,
         abilityName,
         hasAnnotations: !!annotations,
@@ -220,7 +272,7 @@ export async function executeTool(
     // blocks below. The matching "executed" event lives in executeAbility;
     // grep "AUDIT:" for the full trail.
     if (isDestructive) {
-      reqLogger.info('AUDIT: destructive operation requested', {
+      callLogger.info('AUDIT: destructive operation requested', {
         toolName,
         abilityName,
         safeMode: config.safeMode,
@@ -235,12 +287,23 @@ export async function executeTool(
     if (config.safeMode) {
       // Always strip confirm parameter in safe mode (defensive approach)
       if ('confirm' in args) {
-        const { confirm, ...safeArgs } = args;
+        // The supplied value is not logged: it is caller input, and a number
+        // passes the writeOnly log redaction, which matches strings.
+        const { confirm: _confirm, ...safeArgs } = args;
         effectiveArgs = safeArgs;
-        reqLogger.info('Stripped confirm parameter in safe mode', {
-          toolName,
-          hadConfirm: confirm,
-        });
+        callLogger.info('Stripped confirm parameter in safe mode', { toolName });
+      }
+      // Every pinned confirm_*, not only the resolved one: a schema that
+      // declares confirm next to a pinned confirm_* resolves to no channel.
+      for (const confirmationParam of pinnedConfirmationParams(ability.input_schema)) {
+        if (confirmationParam in effectiveArgs) {
+          const { [confirmationParam]: _confirmation, ...safeArgs } = effectiveArgs;
+          effectiveArgs = safeArgs;
+          callLogger.info('Stripped confirmation parameter in safe mode', {
+            toolName,
+            confirmationParam,
+          });
+        }
       }
     }
 
@@ -249,7 +312,7 @@ export async function executeTool(
     // sessionDataBytes tracking. The session data limit is designed to prevent
     // runaway API responses, not small fixed-size local error messages.
     if (decision === 'safe-mode-blocked') {
-      reqLogger.warning('Destructive operation blocked by safe mode', { toolName, abilityName });
+      callLogger.warning('Destructive operation blocked by safe mode', { toolName, abilityName });
       return {
         content: [
           {
@@ -259,6 +322,21 @@ export async function executeTool(
         ],
         isError: true,
       };
+    }
+
+    // user_confirmed and confirmation_token are this server's inputs, added to
+    // the schema of every destructive tool with a confirm channel. The ability
+    // never declared them, and one that rejects unknown keys fails the whole
+    // call, so they are dropped from every upstream input, including calls
+    // made with confirmation disabled. The confirmation flow reads them from
+    // the original args.
+    if (isDestructive && resolveConfirmationParam(ability.input_schema) !== undefined) {
+      const {
+        user_confirmed: _userConfirmed,
+        confirmation_token: _confirmationToken,
+        ...upstreamArgs
+      } = effectiveArgs;
+      effectiveArgs = upstreamArgs;
     }
 
     // Two-phase confirmation flow for destructive operations
@@ -271,7 +349,7 @@ export async function executeTool(
         abilityName,
         args,
         effectiveArgs,
-        logger: reqLogger,
+        logger: callLogger,
         signal: options?.signal,
       });
 
@@ -287,10 +365,11 @@ export async function executeTool(
       config,
       abilityName,
       effectiveArgs,
-      reqLogger,
+      callLogger,
       ability,
       options?.signal
     );
+    observeMaintenanceReceipt(config, abilityName, effectiveArgs, result);
 
     // Check for cancellation after execution
     if (options?.signal?.aborted) {
@@ -300,10 +379,30 @@ export async function executeTool(
     // Format the result as JSON for the AI to parse
     const formattedResult = formatJson(config, result);
 
-    const responseBytes = trackSessionData(formattedResult, config, reqLogger, 'for tool response');
+    let responseBytes: number;
+    try {
+      responseBytes = trackSessionData(formattedResult, config, callLogger, 'for tool response');
+    } catch (error) {
+      if (
+        decision === 'needs-confirmation' &&
+        args.user_confirmed === true &&
+        error instanceof McpError &&
+        error.code === MCP_ERROR_CODES.RESOURCE_EXHAUSTED
+      ) {
+        throw McpErrorFactory.resourceExhausted(
+          "The confirmed request received a successful upstream response, but its result was omitted because of the session limit. Verify the operation's state before retrying.",
+          {
+            execution_attempted: true,
+            upstream_response_received: true,
+            result_omitted: true,
+          }
+        );
+      }
+      throw error;
+    }
 
     const durationMs = Math.round(performance.now() - startTime);
-    reqLogger.info('Tool execution succeeded', {
+    callLogger.info('Tool execution succeeded', {
       toolName,
       success: true,
       durationMs,
@@ -329,11 +428,11 @@ export async function executeTool(
       const responseBytes = trackSessionData(
         noChangeText,
         config,
-        reqLogger,
+        callLogger,
         'during no-op response'
       );
       const durationMs = Math.round(performance.now() - startTime);
-      reqLogger.info('Tool execution no-op (idempotent already-state)', {
+      callLogger.info('Tool execution no-op (idempotent already-state)', {
         toolName,
         durationMs,
         responseBytes,
@@ -343,8 +442,10 @@ export async function executeTool(
     }
 
     const durationMs = Math.round(performance.now() - startTime);
-    const errorMessage = sanitizeError(getErrorMessage(error));
-    reqLogger.error('Tool execution failed', {
+    const redactError = (message: string): string =>
+      sanitizeError(writeOnlyRedactor?.text(message) ?? message);
+    const errorMessage = redactError(getErrorMessage(error));
+    callLogger.error('Tool execution failed', {
       toolName,
       success: false,
       durationMs,
@@ -357,7 +458,7 @@ export async function executeTool(
       content: [
         {
           type: 'text',
-          text: formatErrorResponse(error, sanitizeError),
+          text: formatErrorResponse(error, redactError),
         },
       ],
       isError: true,
