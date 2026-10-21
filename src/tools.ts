@@ -41,6 +41,12 @@ import {
 } from './policy.js';
 import { buildSafeModeBlockedResponse, buildNoChangeResponse } from './confirmation-responses.js';
 import { createWriteOnlyRedactor, type WriteOnlyRedactor } from './write-only.js';
+import {
+  maintenanceTools,
+  MAINTENANCE_TOOLS,
+  executeMaintenance,
+  observeMaintenanceReceipt,
+} from './mrn-maintenance.js';
 
 /**
  * Options for tool execution
@@ -134,6 +140,11 @@ export async function getTools(config: Config, logger?: Logger): Promise<Tool[]>
 
   // Apply allowlist filter (whitelist)
   tools = tools.filter(tool => isToolAllowed(config, tool.name));
+  const localTools = maintenanceTools(config);
+  if (localTools.some(local => tools.some(remote => remote.name === local.name))) {
+    throw McpErrorFactory.permissionDenied('MRN local maintenance tool name collision');
+  }
+  tools.push(...localTools);
 
   // Log if tools were filtered
   if (tools.length !== originalCount && logger) {
@@ -198,6 +209,30 @@ export async function executeTool(
     // tool is indistinguishable from a nonexistent one (no ability-name leak).
     if (decidePolicy(config, toolName) !== 'allow') {
       throw McpErrorFactory.permissionDenied(`Tool is not allowed: ${toolName}`);
+    }
+
+    if ((MAINTENANCE_TOOLS as readonly string[]).includes(toolName)) {
+      const result = await executeMaintenance(config, toolName, args, reqLogger, options?.signal);
+      const text = formatJson(config, result);
+      try {
+        trackSessionData(text, config, reqLogger, 'for MRN maintenance response');
+      } catch (error) {
+        if (args.user_confirmed === true) {
+          throw McpErrorFactory.resourceExhausted(
+            'The maintenance result exceeded the session limit. Inspect provider operation state before retrying.',
+            { execution_attempted: true, result_omitted: true }
+          );
+        }
+        throw error;
+      }
+      return {
+        content: [{ type: 'text', text }],
+        ...(['OUTCOME_UNKNOWN', 'READBACK_REQUIRED', 'PARTIAL_OR_UNVERIFIED'].includes(
+          String(result.status)
+        )
+          ? { isError: true }
+          : {}),
+      };
     }
 
     // Resolve tool name → ability via the cache reverse index built during
@@ -334,6 +369,7 @@ export async function executeTool(
       ability,
       options?.signal
     );
+    observeMaintenanceReceipt(config, abilityName, effectiveArgs, result);
 
     // Check for cancellation after execution
     if (options?.signal?.aborted) {
