@@ -5,10 +5,10 @@ This fork is based on official MainWP MCP **v1.5.1**, commit
 on October 15, 2026. The previous MRN runtime was based on v1.3.0 and pinned at
 `3249bde643f52f29b7b18db41f4c3c7bb88d2434`.
 
-## Remaining patch
+## Remaining patches
 
-The only runtime difference from v1.5.1 is the ceiling for schema-declared
-strings: **69,905,068 characters**, the exact padded base64 length of a
+The package-size compatibility patch raises the ceiling for schema-declared
+strings to **69,905,068 characters**, the exact padded base64 length of a
 **50 MiB (52,428,800 byte) ZIP**. Upstream's 64 MiB character ceiling would
 reject the top of MRN's supported Stack and MU deployment range.
 
@@ -20,6 +20,13 @@ URL limits remain unchanged. No outbound package is truncated or recompressed.
 The previous MRN patches for schema-aware limits, nested-array validation, and
 schema-declared string identifiers are supplied upstream in this release;
 their implementations are not reapplied. No Dashboard plugin changes are needed.
+
+The subsequent MRN maintenance gate adds only the two explicitly allowed local
+plugin/theme tools described in [the maintenance contract](docs/mrn-maintenance.md).
+It preserves receipt provenance, exact versions, preview/confirmation and
+independent readback. Its three closed provider phases use bounded timeout
+floors of 90/180/90 seconds without changing other tools' configured deadlines.
+Core and unguarded stock updates remain excluded.
 
 ## Preserved policy and provider contracts
 

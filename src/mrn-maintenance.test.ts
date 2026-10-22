@@ -32,6 +32,7 @@ const base = {
 const config = makeBaseConfig({
   dashboardUrl: 'https://wpcontrol.mrndev.io',
   skipSslVerify: false,
+  requestTimeout: 30_000,
   abilityNamespaces: ['mainwp', 'mrn-mainwp'],
   allowedTools: [...MAINTENANCE_TOOLS, 'mrn_mainwp__get_database_backup_status_v1', 'get_site_v1'],
 });
@@ -180,6 +181,7 @@ beforeEach(() => {
             })
           )
         );
+      if (name === 'mainwp/get-site-v1') return new Response(JSON.stringify({ id: 7 }));
       throw Error('Unexpected fixture request');
     })
   );
@@ -278,6 +280,107 @@ describe('MRN maintenance through the public executor', () => {
     await issued();
     const r = await call(base, MAINTENANCE_TOOLS[0], { ...config, maxSessionData: 1 });
     expect(r.isError).toBe(true);
+    expect(writes()).toEqual([]);
+  });
+  it.each([30_000, 240_000])(
+    'bounds each phase without changing other tools or the configured %ims deadline',
+    async requestTimeout => {
+      const c = { ...config, requestTimeout };
+      const before = { ...c };
+      const timer = vi.spyOn(globalThis, 'setTimeout');
+      const fetchFixture = vi.mocked(fetch).getMockImplementation()!;
+      const observed: Array<{ name: string; timeout: unknown }> = [];
+      vi.mocked(fetch).mockImplementation((raw, options) => {
+        const url = new URL(String(raw));
+        if (url.pathname.endsWith('/run'))
+          observed.push({
+            name: decodeURIComponent(url.pathname.split('/abilities/')[1].slice(0, -4)),
+            timeout: timer.mock.calls.at(-1)?.[1],
+          });
+        return fetchFixture(raw, options);
+      });
+      const r = await call(
+        { site_id: 7, nonce: receipt.nonce },
+        'mrn_mainwp__get_database_backup_status_v1',
+        c
+      );
+      expect(r.isError).not.toBe(true);
+      const p = body(await call(base, MAINTENANCE_TOOLS[0], c));
+      expect(
+        (
+          await call(
+            {
+              ...base,
+              confirm: true,
+              user_confirmed: true,
+              confirmation_token: p.confirmation_token,
+            },
+            MAINTENANCE_TOOLS[0],
+            c
+          )
+        ).isError
+      ).not.toBe(true);
+      expect((await call({ site_id: 7 }, 'get_site_v1', c)).isError).not.toBe(true);
+      expect(observed).toEqual([
+        { name: 'mrn-mainwp/get-database-backup-status-v1', timeout: requestTimeout },
+        { name: 'mrn-mainwp/' + names[0], timeout: Math.max(requestTimeout, 90_000) },
+        { name: 'mrn-mainwp/' + names[0], timeout: Math.max(requestTimeout, 90_000) },
+        { name: 'mrn-mainwp/' + names[1], timeout: Math.max(requestTimeout, 180_000) },
+        { name: 'mrn-mainwp/' + names[2], timeout: Math.max(requestTimeout, 90_000) },
+        { name: 'mainwp/get-site-v1', timeout: requestTimeout },
+      ]);
+      expect(c).toEqual(before);
+      expect(operations).toBe(1);
+    }
+  );
+  it('waits beyond 30s but stops at the bounded preflight deadline without retrying', async () => {
+    vi.useFakeTimers();
+    await issued();
+    const fixture = vi.mocked(fetch).getMockImplementation()!;
+    let preflights = 0;
+    vi.mocked(fetch).mockImplementation((raw, options) => {
+      if (!String(raw).includes('/preflight-maintenance-v1/run')) return fixture(raw, options);
+      preflights++;
+      return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('', 'AbortError'))
+        );
+      });
+    });
+    let settled = false;
+    const pending = call().then(r => {
+      settled = true;
+      return r;
+    });
+    await vi.waitFor(() => expect(preflights).toBe(1));
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(JSON.stringify(body(await pending))).toContain('MAINTENANCE_PREFLIGHT_FAILED');
+    expect(preflights).toBe(1);
+    expect(writes()).toEqual([]);
+  });
+  it('honors external cancellation during a longer preflight wait without a write', async () => {
+    vi.useFakeTimers();
+    await issued();
+    const fixture = vi.mocked(fetch).getMockImplementation()!;
+    let started = false;
+    vi.mocked(fetch).mockImplementation((raw, options) => {
+      if (!String(raw).includes('/preflight-maintenance-v1/run')) return fixture(raw, options);
+      started = true;
+      return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('', 'AbortError'))
+        );
+      });
+    });
+    const controller = new AbortController();
+    const pending = executeTool(config, MAINTENANCE_TOOLS[0], base, logger, {
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(started).toBe(true));
+    controller.abort();
+    expect((await pending).isError).toBe(true);
     expect(writes()).toEqual([]);
   });
   it.each(['failed', 'running', 'pending'])('does not trust a %s backup response', async status => {
