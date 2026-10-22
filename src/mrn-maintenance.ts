@@ -18,6 +18,10 @@ const PROVIDERS = [
   'execute-maintenance-v1',
   'read-maintenance-state-v1',
 ];
+// Native package inspection and tree hashing can outlive the ordinary 30s
+// request budget. Keep these waits bounded and local to the three closed
+// maintenance phases; external cancellation and all server gates still apply.
+const PHASE_TIMEOUTS = [90_000, 180_000, 90_000] as const;
 const MAX_AGE = 5 * 60_000;
 const RECEIPT_MAX_AGE = 2 * 60 * 60_000;
 type Item = { slug: string; from: string; to: string };
@@ -420,7 +424,14 @@ export async function executeMaintenance(
       'MAINTENANCE_PROVIDER_REQUIRED: Dashboard must validate remote Updraft receipts and atomically bind exact child versions. Stock updates are not a safe fallback.'
     );
   const run = (i: number, input: Record<string, unknown>) =>
-    executeAbility(config, provider[i].name, input, logger, provider[i], signal);
+    executeAbility(
+      { ...config, requestTimeout: Math.max(config.requestTimeout, PHASE_TIMEOUTS[i]) },
+      provider[i].name,
+      input,
+      logger,
+      provider[i],
+      signal
+    );
   let rawPlan: unknown;
   try {
     rawPlan = await run(0, r);

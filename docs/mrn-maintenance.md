@@ -1,10 +1,15 @@
 # MRN maintenance boundary
 
-This change adds a **local client gate**, not a deployed maintenance provider.
-The installed Dashboard 6.3 / MRN provider 0.13.8 cannot satisfy its execution
-contract. **Plugin and theme maintenance is not restored yet.** The new tools
-fail closed with `MAINTENANCE_PROVIDER_REQUIRED` after receipt provenance checks.
-Do not treat tool discovery or passing fixtures as permission to run updates.
+The local tools require a separately qualified Dashboard provider and Child
+maintenance guard. A missing contract fails closed with
+`MAINTENANCE_PROVIDER_REQUIRED` after receipt provenance checks. Tool discovery
+or passing fixtures never authorizes an update.
+
+As of October 22, 2026, Dashboard 6.3 / MRN provider 0.13.9 advertises the
+contract. The company-site canary has guard 0.8.4, with installed tree readback
+and a successful native preflight. This is not fleet-wide Child qualification
+or proof of an executed maintenance update. Site adoption and maintenance
+execution remain separate authorized operations.
 
 ## Provenance and policy
 
@@ -101,7 +106,7 @@ Changed state requires a new preview. Logs contain request/plan identities,
 never receipts or arbitrary provider response content. Partial, lost-response,
 and readback failures never become success or trigger automatic retries.
 
-## Required hosted provider work — NOT implemented or deployed here
+## Required hosted provider contract
 
 Three dedicated, reviewed abilities must advertise
 `meta.mrn_maintenance_contract = mrn-maintenance-exact-versions-remote-updraft-v1`:
@@ -145,26 +150,53 @@ helpers stay outside the MCP allowlist; the compiled local gate can invoke
 only these exact three helper names under its own existing policy boundary.
 Merely adding the contract string to an old updater does not implement it.
 Native provider/Child qualification is mandatory before deployment; the
-protocol fixtures here are **not** proof of that future implementation.
+protocol fixtures here are **not** proof of a particular hosted installation.
+
+## Bounded maintenance waits
+
+The three closed provider phases use HTTP timeout floors of 90 seconds for
+preflight, 180 seconds for execution, and 90 seconds for independent readback.
+A longer configured deadline is preserved. The client copies configuration in
+memory for these calls; other tools retain their configured deadline. External
+cancellation, response-size limits, authentication, TLS, server download limits,
+receipt/plan expiry, and confirmation are unchanged. Write requests are never
+automatically retried. An execution timeout remains an unknown outcome that
+must be reconciled against the durable request ledger before further action.
+
+This addresses a demonstrated company preflight taking about 50 seconds,
+which succeeded with a 90-second client budget but lost its response with the
+ordinary 30-second deadline. If the MCP host imposes its own shorter tool-call
+deadline, that host must allow the bounded operation to finish; increasing the
+HTTP wait cannot override host cancellation.
 
 ## Qualification, local switch and rollback
 
-Run focused fixtures, the Python policy tests, existing MRN compatibility and
-upstream tests, lint/typecheck/build, and the smallest MRN QA/staged gate. No
-production update is part of qualification. Pin a committed, passing build;
-preserve the previous pin. `scripts/mrn-maintenance-policy.py apply --pin <pin>
---evidence <owner-only-directory>` changes only the launch pin and two exact
-allowlist additions. It uses mode-0600 atomic writes with concurrent-edit
-guards and stores only non-secret policy/launch metadata. The generated
-`rollback.py` refuses subsequent policy changes and preserves credential bytes.
+Run focused fixtures, existing MRN compatibility and upstream tests,
+lint/typecheck/build, fixture acceptance and the smallest MRN QA/staged gate.
+No production update is part of qualification. Pin a committed, passing build
+and preserve the previous pin. Switch only the existing `mainwp` launch entry
+in each authorized client, with a concurrent-edit guard and atomic mode-0600
+write. Keep settings, every allowed tool, namespace order and credentials
+unchanged. Save only non-secret launch/policy metadata and a guarded rollback
+script; never copy a credential-bearing configuration into an audit directory.
 
-Use `scripts/mrn-maintenance-probe.ts` to launch fresh old/new processes, compare
-all existing schemas, and prove the exact 67-to-69 discovery delta, receipt and
-major refusals, and core exclusion without any child-site request. The probe
-also requires the installed provider to report execution unavailable. This is
-an explicit current limitation, not a successful update/deployment claim.
+Start a fresh process and verify `mainwp://status` names the expected Dashboard,
+all configured tools and schemas remain present, core is excluded, and missing
+receipts and unapproved major changes refuse before any child write. Where
+separately authorized, verify a same-site receipt and read-only maintenance
+preview, then independently check that the installed version did not change.
+A preview must return `CONFIRMATION_REQUIRED`; do not send confirmation just to
+prove connectivity. A provider advertising the contract does not prove that
+every Child has adopted its guard.
 
-After a local switch reconnect MainWP in existing chats. A new tool list does
-not repair the missing hosted contract. A separately authorized provider/Child
-implementation, native QA, verified backups, deployment, and installed readback
-are still required before a maintenance session can perform updates.
+The earlier `mrn-maintenance-policy.py` and `mrn-maintenance-probe.ts` record the
+original 67-to-69 tool rollout with an unavailable provider. Their assertions
+are historical: do not use them to overwrite a later policy or claim a current
+provider is unavailable. A later pin replacement must compare the actual
+current allowlist and schemas instead.
+
+After switching, reconnect MainWP or start a new chat in Claude/Codex. The
+configured pin and a separately verified fresh process do not identify which
+runtime an already-open chat is serving. Roll back the launch entry to the
+preserved pin using the recorded concurrent-edit guard; restart/reconnect again.
+A local runtime rollback does not revert an installed Dashboard or Child guard.
