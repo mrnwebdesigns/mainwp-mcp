@@ -56,6 +56,8 @@ let requests: Array<{ name: string; input: Record<string, unknown> }>;
 let planHash: string;
 let planPatch: (value: Record<string, unknown>) => Record<string, unknown>;
 let readPatch: (value: Record<string, unknown>) => Record<string, unknown>;
+let outcomePatch: (value: Record<string, unknown>) => Record<string, unknown>;
+let readLost: boolean;
 let executeMode: 'success' | 'partial' | 'lost';
 let operations: number;
 let receiptPatch: Record<string, unknown>;
@@ -105,6 +107,8 @@ beforeEach(() => {
   planHash = 'a'.repeat(64);
   planPatch = v => v;
   readPatch = v => v;
+  outcomePatch = v => v;
+  readLost = false;
   executeMode = 'success';
   operations = 0;
   receiptPatch = {};
@@ -155,17 +159,20 @@ beforeEach(() => {
         operations++;
         if (executeMode === 'lost') throw Error('simulated response loss');
         return new Response(
-          JSON.stringify({
-            contract: MAINTENANCE_CONTRACT,
-            status: executeMode === 'partial' ? 'partial' : 'complete',
-            request_id: input.request_id,
-            site_id: input.site_id,
-            site_url: input.site_url,
-            plan_sha256: input.plan_sha256,
-          })
+          JSON.stringify(
+            outcomePatch({
+              contract: MAINTENANCE_CONTRACT,
+              status: executeMode === 'partial' ? 'partial' : 'complete',
+              request_id: input.request_id,
+              site_id: input.site_id,
+              site_url: input.site_url,
+              plan_sha256: input.plan_sha256,
+            })
+          )
         );
       }
-      if (name.endsWith('/read-maintenance-state-v1'))
+      if (name.endsWith('/read-maintenance-state-v1')) {
+        if (readLost) throw Error('simulated readback loss');
         return new Response(
           JSON.stringify(
             readPatch({
@@ -181,17 +188,226 @@ beforeEach(() => {
             })
           )
         );
+      }
       if (name === 'mainwp/get-site-v1') return new Response(JSON.stringify({ id: 7 }));
       throw Error('Unexpected fixture request');
     })
   );
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 
 describe('MRN maintenance through the public executor', () => {
+  it('binds trailing-slash aliases to the same exact site and confirmation', async () => {
+    await issued();
+    const p = await preview({ ...base, site_url: base.site_url + '/' });
+    expect(p.site_url).toBe(base.site_url);
+    expect(
+      body(
+        await call({
+          ...base,
+          confirm: true,
+          user_confirmed: true,
+          confirmation_token: p.confirmation_token,
+        })
+      ).status
+    ).toBe('VERIFIED');
+    expect(writes()).toHaveLength(1);
+  });
+  it.each([
+    'https://site.example//',
+    'https://site.example/?x=1',
+    'https://site.example/#fragment',
+    'https://site.example:443/',
+    'https://site.example./',
+    'http://site.example/',
+  ])('refuses ambiguous site URL %s', async site_url => {
+    await issued();
+    expect((await call({ ...base, site_url })).isError).toBe(true);
+    expect(writes()).toHaveLength(0);
+  });
+  it('reports material stale-state components and never writes', async () => {
+    await issued();
+    const component = 'plugins:example/example.php:tree';
+    let tree = 'c'.repeat(64);
+    planPatch = v => ({ ...v, state_fingerprints: { [component]: tree } });
+    const p = await preview();
+    tree = 'd'.repeat(64);
+    planHash = 'b'.repeat(64);
+    const result = body(
+      await call({
+        ...base,
+        confirm: true,
+        user_confirmed: true,
+        confirmation_token: p.confirmation_token,
+      })
+    );
+    expect(result.error.data).toMatchObject({
+      reason: 'material_state_changed',
+      execution_attempted: false,
+      changes: [{ component, previous_sha256: 'c'.repeat(64), current_sha256: tree }],
+    });
+    expect(writes()).toHaveLength(0);
+  });
+  it('expires the local confirmation at the retained server plan deadline', async () => {
+    await issued();
+    const expires = Date.now() + 20_000;
+    planPatch = v => ({ ...v, expires_at: expires });
+    const p = await preview();
+    expect(p.expires_at).toBe(expires);
+    vi.spyOn(Date, 'now').mockReturnValue(expires + 1);
+    expect(
+      (
+        await call({
+          ...base,
+          confirm: true,
+          user_confirmed: true,
+          confirmation_token: p.confirmation_token,
+        })
+      ).isError
+    ).toBe(true);
+    expect(writes()).toHaveLength(0);
+  });
+  it('reports per-item preflight failures without reflecting arbitrary provider text', async () => {
+    await issued();
+    planPatch = v => ({
+      ...v,
+      ready: false,
+      failure: {
+        stage: 'child_package',
+        code: 'package_invalid',
+        secret: receipt.receipt,
+        items: [
+          {
+            slug: base.items[0].slug,
+            success: false,
+            stage: 'child_download',
+            code: 'download_http_denied',
+            secret: receipt.receipt,
+          },
+        ],
+      },
+    });
+    const result = await call();
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(receipt.receipt);
+    expect(body(result).error.data.failure).toMatchObject({
+      stage: 'child_package',
+      code: 'package_invalid',
+      items: [
+        {
+          slug: base.items[0].slug,
+          success: false,
+          stage: 'child_download',
+          code: 'download_http_denied',
+        },
+      ],
+    });
+    expect(writes()).toHaveLength(0);
+  });
+  it('distinguishes failed child preinstall with unchanged installed state', async () => {
+    await issued();
+    executeMode = 'partial';
+    const item = {
+      slug: base.items[0].slug,
+      success: false,
+      stage: 'child_preinstall',
+      code: 'stale_preinstall',
+      replacement_started: false,
+    };
+    outcomePatch = v => ({ ...v, results: [item] });
+    readPatch = v => ({
+      ...v,
+      items: base.items.map(i => ({ slug: i.slug, version: i.from })),
+      installed_state_changed: false,
+      change_reached_site: false,
+      provider_status: 'partial',
+      results: [item],
+    });
+    expect(body(await confirmed())).toMatchObject({
+      status: 'PARTIAL_OR_UNVERIFIED',
+      failure_stage: 'child_execution',
+      item_results: [item],
+      installed_verified: false,
+      provider_succeeded: false,
+      change_reached_site: false,
+      installed_state_changed: false,
+      installed_items: [{ slug: base.items[0].slug, version: base.items[0].from }],
+      automatic_retry: false,
+    });
+  });
+  it.each(['missing', 'partial', 'duplicate', 'unknown'])(
+    'keeps %s legacy replacement evidence unknown',
+    async evidence => {
+      await issued();
+      executeMode = 'partial';
+      const input = {
+        ...base,
+        items: [...base.items, { slug: 'second/second.php', from: '1.0', to: '1.1' }],
+      };
+      readPatch = v => ({
+        ...v,
+        items: input.items.map(i => ({ slug: i.slug, version: i.from })),
+        installed_state_changed: false,
+        change_reached_site: false,
+        provider_status: evidence === 'unknown' ? 'outcome_unknown' : 'partial',
+        results:
+          evidence === 'missing'
+            ? input.items.map(i => ({ slug: i.slug, success: false }))
+            : evidence === 'partial'
+              ? [{ slug: input.items[0].slug, success: false, replacement_started: false }]
+              : input.items.map((i, index) => ({
+                  slug: evidence === 'duplicate' ? input.items[0].slug : i.slug,
+                  success: false,
+                  replacement_started: false,
+                  index,
+                })),
+      });
+      expect(body(await confirmed(input))).toMatchObject({
+        status: 'PARTIAL_OR_UNVERIFIED',
+        change_reached_site: 'unknown',
+        installed_state_changed: false,
+        automatic_retry: false,
+      });
+    }
+  );
+  it('names a lost independent readback and retains child diagnostics without retry', async () => {
+    await issued();
+    readLost = true;
+    const result = body(await confirmed());
+    expect(result).toMatchObject({
+      status: 'READBACK_REQUIRED',
+      failure: { stage: 'independent_readback' },
+      change_reached_site: 'unknown',
+      automatic_retry: false,
+    });
+    expect(operations).toBe(1);
+  });
+  it('does not attribute another operation diagnostic when readback is lost', async () => {
+    await issued();
+    readLost = true;
+    outcomePatch = v => ({
+      ...v,
+      request_id: 'another-operation',
+      results: [
+        {
+          slug: base.items[0].slug,
+          success: false,
+          stage: 'child_update',
+          code: 'native_update_failed',
+        },
+      ],
+    });
+    expect(body(await confirmed())).toMatchObject({
+      status: 'READBACK_REQUIRED',
+      item_results: [],
+      change_reached_site: 'unknown',
+      automatic_retry: false,
+    });
+  });
   it('adds exactly two opted-in tools and preserves the existing namespace surface', async () => {
     expect((await getTools(config, logger)).map(t => t.name).sort()).toEqual(
       [...config.allowedTools!].sort()
