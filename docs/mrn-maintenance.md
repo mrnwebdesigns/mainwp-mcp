@@ -66,8 +66,8 @@ requires a new status read. Caller-supplied text is never trusted as receipt
 provenance. The server must independently validate and consume the receipt too.
 
 Read the exact URL and current versions with existing MainWP discovery tools.
-The local gate requires one positive site ID, canonical exact HTTPS URL without
-a trailing slash, and a nonempty selection with explicit numeric `from`/`to`
+The local gate requires one positive site ID and an exact HTTPS URL (one final
+slash is accepted and normalized away), and a nonempty selection with explicit numeric `from`/`to`
 versions. Unknown versions, downgrades, duplicate or expanded selections, core
 inputs, and implicit all-sites/all-items requests fail closed.
 
@@ -200,3 +200,66 @@ configured pin and a separately verified fresh process do not identify which
 runtime an already-open chat is serving. Roll back the launch entry to the
 preserved pin using the recorded concurrent-edit guard; restart/reconnect again.
 A local runtime rollback does not revert an installed Dashboard or Child guard.
+
+## October 23 confirmation and failure diagnostics repair
+
+The repaired Dashboard retains at most 100 active, non-autoloaded approval
+identity records containing only a material-state digest, UUID generation and
+original expiry. A short storage reservation serializes capacity and pruning;
+unknown/corrupt metadata or a held lock refuses without reset. Expired rows are
+pruned during preflight. The full child snapshot remains transient and freshly
+inspected. Eviction can reconstruct the **same original plan**, including its
+generation and expiry. Neither expiry nor generation is removed from the plan
+hash. Changing state or expiring the approval requires a new human approval.
+The local token additionally respects the retained server deadline when supplied.
+
+On `MAINTENANCE_STALE_STATE`, inspect `error.data.changes`. Each entry names a
+plugin/theme version, activation, tree, package, core/runtime component or backup
+attestation whose hash changed. Code-file changes are still material even when
+the version header stayed equal. Do not bypass them by changing the expected
+hash. Legacy providers without fingerprints return
+`reason:provider_plan_identity_changed`; this identifies a provider limitation,
+not proof that installed state changed. Repreview and obtain fresh approval only
+after resolving the named changes. A consumed token is never reusable.
+
+Preflight failures contain a closed stage/code and per-item results, including
+the exact selected slug. Child offer, download and package checks inspect all
+requested items and refuse the entire write if any fails. Dashboard ignored or
+missing selections remain refused. No URL, exception message or native log is
+included in these diagnostics.
+
+Execution results separate the Dashboard response, child execution and independent
+readback. Per-item results name the stage/code and whether destination processing
+started; later items explicitly report `not_attempted`. `installed_items` is fresh
+readback, and `installed_state_changed` compares versions, bytes and activation
+with the retained before-state. `change_reached_site:false` is returned only when
+readback is unchanged **and** the retained operation proves replacement never
+started. Unchanged readback after attempted replacement is `unknown`: a rollback
+may have happened. Lost responses and unverified reads remain unknown and never
+trigger automatic retries. Old providers cannot supply this evidence and report
+unknown rather than manufacturing a no-change claim.
+
+The Child retains the one-item native bulk plugin updater and now blocks active
+plugin option changes within the update scope. An attempted deactivation makes
+the operation fail and stop the batch; no guessed reactivation of changed code
+is attempted. Independent readback still requires every original activation bit.
+This does not establish what caused any pre-existing inactive plugin.
+
+Qualification and deployment are separate. Deploy the reviewed Dashboard repair
+to `wpcontrol.mrndev.io` and the reviewed MU guard to one separately approved pilot
+through the existing exact-package/backup gates. Then pin the tested connector,
+atomically change only the existing launch entry, and reconnect clients. Preserve
+the old pin and packages. Never add the stock update tools or reset receipt/operation
+ledgers. Drain existing five-minute previews before a version switch. A new chat
+alone cannot activate source changes that have not been deployed and pinned.
+
+For a read-only comparison of fresh processes with the existing settings:
+
+```sh
+npx tsx scripts/mrn-maintenance-regression-probe.ts \
+  /absolute/previous/dist/index.js /absolute/candidate/dist/index.js \
+  /absolute/private/probe-result.json
+```
+
+This uses no allowlist override and starts no child-site operation. It checks the
+unchanged tool schemas, Dashboard identity and local backup/major/core refusals.

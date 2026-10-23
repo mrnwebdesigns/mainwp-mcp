@@ -6,6 +6,7 @@ import type { Config } from './config.js';
 import type { Logger } from './logging.js';
 import { decidePolicy, isToolAllowed } from './policy.js';
 import { validateInput } from './security.js';
+import { McpErrorFactory, UpstreamHttpError } from './errors.js';
 
 export const MAINTENANCE_TOOLS = [
   'mrn_mainwp__maintenance_plugins_v1',
@@ -40,6 +41,7 @@ type Pending = {
   expires: number;
   requestId: string;
   started: number;
+  state?: Record<string, string>;
 };
 const receipts = new Map<string, { expires: number; started: number; ttl: number }>();
 const previews = new Map<string, Pending>();
@@ -53,6 +55,187 @@ const hash = (x: unknown): x is string => typeof x === 'string' && /^[a-f0-9]{64
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const identity = (c: Config, r: Receipt) =>
   sha([configIdentityHash(c), r.site_id, r.nonce, r.receipt]);
+
+// Only closed codes and exact selected slugs cross this diagnostic boundary.
+const STAGES = new Set([
+  'child_validation',
+  'child_backup',
+  'child_snapshot',
+  'child_offer',
+  'child_download',
+  'child_package',
+  'child_update',
+  'child_preinstall',
+  'child_postinstall',
+  'dashboard_child_transport',
+  'dashboard_inventory',
+]);
+const CODES = new Set([
+  'verified',
+  'internal_error',
+  'unsupported_runtime',
+  'invalid_schema',
+  'selection_required',
+  'invalid_override',
+  'invalid_target',
+  'unknown_version',
+  'version_refused',
+  'unused_override',
+  'tree_unavailable',
+  'tree_unsafe',
+  'tree_limit',
+  'tree_unreadable',
+  'plugin_unreadable',
+  'theme_invalid',
+  'core_unavailable',
+  'offer_changed',
+  'shared_plugin_directory',
+  'download_unavailable',
+  'download_failed',
+  'package_invalid',
+  'package_limit',
+  'package_alias_or_type',
+  'package_path',
+  'package_version',
+  'package_name',
+  'theme_template_changed',
+  'backup_unverified',
+  'preflight_state_changed',
+  'backup_nonce_invalid',
+  'storage_adapter_unavailable',
+  'remote_inventory_unavailable',
+  'remote_inventory_schema',
+  'remote_region_unavailable',
+  'backup_remote_verification_failed',
+  'recent_labeled_database_backup_required',
+  'maintenance_backup_log_unavailable',
+  'maintenance_backup_not_complete',
+  'maintenance_backup_expired',
+  'maintenance_backup_label_required',
+  'download_http_blocked',
+  'download_transport_failed',
+  'download_dns_failed',
+  'download_connection_failed',
+  'download_incomplete',
+  'download_stream_failed',
+  'download_timeout',
+  'download_tls_failed',
+  'download_empty_reply',
+  'download_certificate_failed',
+  'download_http_denied',
+  'download_http_unavailable',
+  'download_http_limited',
+  'download_http_server_error',
+  'download_http_status',
+  'download_empty',
+  'download_size_limit',
+  'package_changed',
+  'mainwp_rollback_contract_unavailable',
+  'installed_version_changed',
+  'backup_expired_before_write',
+  'postinstall_state_changed',
+  'native_update_failed',
+  'stale_plan',
+  'operation_identity',
+  'operation_locked',
+  'request_conflict',
+  'request_already_reserved',
+  'audit_capacity',
+  'ledger_unavailable',
+  'backup_nonce_consumed',
+  'ledger_readback_failed',
+  'operation_unavailable',
+  'read_identity',
+  'read_selection',
+  'stale_preinstall',
+  'activation_change_blocked',
+  'child_transport_or_contract',
+  'not_attempted',
+  'ignored_or_changed',
+  'not_offered_or_ignored',
+  'preview_versions',
+]);
+function diagnostic(value: unknown, request: Request): Record<string, unknown> | undefined {
+  if (!object(value) || !STAGES.has(String(value.stage)) || !CODES.has(String(value.code))) return;
+  return {
+    stage: value.stage,
+    code: value.code,
+    ...(Array.isArray(value.items) ? { items: results(value.items, request) } : {}),
+  };
+}
+function results(value: unknown, request: Request): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length > request.items.length) return [];
+  const seen = new Set<string>();
+  return value.flatMap(v => {
+    if (
+      !object(v) ||
+      typeof v.slug !== 'string' ||
+      seen.has(v.slug) ||
+      !request.items.some(i => i.slug === v.slug) ||
+      typeof v.success !== 'boolean' ||
+      !STAGES.has(String(v.stage)) ||
+      !CODES.has(String(v.code))
+    )
+      return [];
+    seen.add(v.slug);
+    return [
+      {
+        slug: v.slug,
+        success: v.success,
+        stage: v.stage,
+        code: v.code,
+        ...(typeof v.replacement_started === 'boolean'
+          ? { replacement_started: v.replacement_started }
+          : {}),
+      },
+    ];
+  });
+}
+function fingerprints(value: unknown): Record<string, string> | undefined {
+  if (!object(value) || Object.keys(value).length > 8000) return;
+  if (
+    !Object.entries(value).every(
+      ([k, v]) =>
+        k.length <= 250 &&
+        /^(?:(?:plugins|themes):[A-Za-z0-9_./-]+:(?:version|active|tree|template)|core:(?:version|db_version|admin|includes|root)|runtime:(?:stylesheet|template)|package:[A-Za-z0-9_./-]+|backup)$/.test(
+          k
+        ) &&
+        hash(v)
+    )
+  )
+    return;
+  return value as Record<string, string>;
+}
+function upstreamFailure(error: unknown, stage: string): Record<string, unknown> {
+  return {
+    stage,
+    code:
+      error instanceof UpstreamHttpError &&
+      /^mrn_maintenance_[a-z_]{1,64}$/.test(error.upstreamCode ?? '')
+        ? error.upstreamCode
+        : 'provider_transport_or_contract',
+    automatic_retry: false,
+  };
+}
+
+/** A legacy/partial ledger cannot prove that a replacement never started. */
+function noReplacementProven(value: Record<string, unknown>, request: Request): boolean {
+  return (
+    value.installed_state_changed === false &&
+    value.unrelated_unchanged === true &&
+    value.core_unchanged === true &&
+    ['complete', 'partial'].includes(String(value.provider_status)) &&
+    Array.isArray(value.results) &&
+    value.results.length === request.items.length &&
+    value.results.every(
+      (row, index) =>
+        object(row) &&
+        row.slug === request.items[index].slug &&
+        typeof row.success === 'boolean' &&
+        row.replacement_started === false
+    )
+  );
+}
 
 function prune(): void {
   for (const [k, v] of receipts) if (v.expires <= Date.now()) receipts.delete(k);
@@ -164,7 +347,14 @@ function exactKeys(value: Record<string, unknown>, allowed: string[]): boolean {
 }
 function siteUrl(value: unknown): string {
   if (typeof value !== 'string') return fail('MAINTENANCE_SITE_IDENTITY');
-  const u = new URL(value);
+  let u: URL;
+  try {
+    u = new URL(value);
+  } catch {
+    return fail('MAINTENANCE_SITE_IDENTITY');
+  }
+  // Accept one conventional final slash, without accepting other URL aliases.
+  const canonical = u.href.replace(/\/$/, '');
   if (
     u.protocol !== 'https:' ||
     u.username ||
@@ -173,10 +363,11 @@ function siteUrl(value: unknown): string {
     u.hash ||
     u.port ||
     u.hostname.endsWith('.') ||
-    value !== u.href.replace(/\/$/, '')
+    u.pathname.endsWith('//') ||
+    (value !== canonical && value !== canonical + '/')
   )
     return fail('MAINTENANCE_SITE_IDENTITY');
-  return value;
+  return canonical;
 }
 function normalize(config: Config, name: string, args: Record<string, unknown>): Request {
   if (
@@ -386,7 +577,17 @@ function checkPlan(value: unknown, request: Request): { plan: string; expires: n
     return fail('MAINTENANCE_REMOTE_BACKUP_UNVERIFIED');
   return {
     plan: value.plan_sha256,
-    expires: Math.min(Date.now() + MAX_AGE, b.expires_at as number),
+    expires: Math.min(
+      Date.now() + MAX_AGE,
+      b.expires_at as number,
+      value.expires_at === undefined
+        ? Infinity
+        : Number.isSafeInteger(value.expires_at) &&
+            (value.expires_at as number) > Date.now() &&
+            (value.expires_at as number) <= (b.expires_at as number)
+          ? (value.expires_at as number)
+          : fail('MAINTENANCE_PROVIDER_PLAN_EXPIRED')
+    ),
   };
 }
 
@@ -435,9 +636,20 @@ export async function executeMaintenance(
   let rawPlan: unknown;
   try {
     rawPlan = await run(0, r);
-  } catch {
-    return fail('MAINTENANCE_PREFLIGHT_FAILED');
+  } catch (error) {
+    throw McpErrorFactory.invalidParams(
+      'MAINTENANCE_PREFLIGHT_FAILED',
+      upstreamFailure(error, 'dashboard_preflight')
+    );
   }
+  if (object(rawPlan) && rawPlan.contract === MAINTENANCE_CONTRACT && rawPlan.ready === false)
+    throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
+      failure: diagnostic(rawPlan.failure, r) ?? {
+        stage: 'dashboard_preflight',
+        code: 'provider_contract',
+      },
+      execution_attempted: false,
+    });
   const plan = checkPlan(rawPlan, r);
   receiptValid(config, r.backup_receipt);
   if (!pending) {
@@ -450,6 +662,7 @@ export async function executeMaintenance(
       expires: plan.expires,
       requestId: crypto.randomUUID(),
       started: performance.now(),
+      state: object(rawPlan) ? fingerprints(rawPlan.state_fingerprints) : undefined,
     });
     return {
       status: 'CONFIRMATION_REQUIRED',
@@ -466,7 +679,28 @@ export async function executeMaintenance(
         'Show this exact plan and obtain explicit human approval before repeating with confirm=true, user_confirmed=true and this token.',
     };
   }
-  if (plan.plan !== pending.plan) fail('MAINTENANCE_STALE_STATE');
+  if (plan.plan !== pending.plan) {
+    const current = object(rawPlan) ? fingerprints(rawPlan.state_fingerprints) : undefined;
+    const changes =
+      pending.state && current
+        ? [...new Set([...Object.keys(pending.state), ...Object.keys(current)])]
+            .sort()
+            .filter(k => pending!.state![k] !== current[k])
+            .map(component => ({
+              component,
+              previous_sha256: pending!.state![component] ?? null,
+              current_sha256: current[component] ?? null,
+            }))
+        : [];
+    throw McpErrorFactory.invalidParams('MAINTENANCE_STALE_STATE', {
+      previous_plan_sha256: pending.plan,
+      current_plan_sha256: plan.plan,
+      changes,
+      reason: changes.length ? 'material_state_changed' : 'provider_plan_identity_changed',
+      execution_attempted: false,
+      automatic_retry: false,
+    });
+  }
   if (pending.expires <= Date.now() || plan.expires <= Date.now())
     fail('MAINTENANCE_CONFIRMATION_STALE');
   if (signal?.aborted) fail('MAINTENANCE_CANCELLED');
@@ -486,7 +720,7 @@ export async function executeMaintenance(
       request_id: pending.requestId,
       confirm: true,
     });
-  } catch {
+  } catch (error) {
     return {
       status: 'OUTCOME_UNKNOWN',
       site_id: r.site_id,
@@ -496,10 +730,20 @@ export async function executeMaintenance(
       plan_sha256: plan.plan,
       request_id: pending.requestId,
       automatic_retry: false,
+      failure: upstreamFailure(error, 'dashboard_execute'),
+      change_reached_site: 'unknown',
       message:
         'The request may have reached the child. Inspect installed state and provider operation status; do not repeat the write.',
     };
   }
+  const outcomeBound =
+    object(outcome) &&
+    outcome.contract === MAINTENANCE_CONTRACT &&
+    outcome.site_id === r.site_id &&
+    outcome.site_url === r.site_url &&
+    outcome.request_id === pending.requestId &&
+    outcome.plan_sha256 === plan.plan;
+  const boundOutcome = outcomeBound && object(outcome) ? outcome : undefined;
   let readback: unknown;
   try {
     readback = await run(2, {
@@ -510,7 +754,7 @@ export async function executeMaintenance(
       request_id: pending.requestId,
       plan_sha256: plan.plan,
     });
-  } catch {
+  } catch (error) {
     return {
       status: 'READBACK_REQUIRED',
       site_id: r.site_id,
@@ -520,6 +764,10 @@ export async function executeMaintenance(
       plan_sha256: plan.plan,
       request_id: pending.requestId,
       automatic_retry: false,
+      failure: upstreamFailure(error, 'independent_readback'),
+      provider_result: boundOutcome ? diagnostic(boundOutcome.failure, r) : undefined,
+      item_results: boundOutcome ? results(boundOutcome.results, r) : [],
+      change_reached_site: 'unknown',
     };
   }
   const verified =
@@ -544,6 +792,15 @@ export async function executeMaintenance(
     outcome.site_id === r.site_id &&
     outcome.site_url === r.site_url &&
     outcome.plan_sha256 === plan.plan;
+  const readBound =
+    object(readback) &&
+    readback.contract === MAINTENANCE_CONTRACT &&
+    readback.site_id === r.site_id &&
+    readback.site_url === r.site_url &&
+    readback.kind === r.kind &&
+    readback.request_id === pending.requestId &&
+    readback.plan_sha256 === plan.plan;
+  const boundRead = readBound && object(readback) ? readback : undefined;
   logger.info('AUDIT: MRN maintenance verification completed', {
     toolName: name,
     siteId: r.site_id,
@@ -559,7 +816,48 @@ export async function executeMaintenance(
     items: r.items,
     installed_verified: verified,
     provider_succeeded: succeeded,
+    phases: {
+      dashboard_provider_call: 'returned',
+      child_site_execution:
+        boundOutcome &&
+        ['complete', 'partial', 'outcome_unknown'].includes(String(boundOutcome.status))
+          ? boundOutcome.status
+          : 'unverified',
+      independent_readback: verified
+        ? 'verified'
+        : boundRead
+          ? 'state_mismatch'
+          : 'identity_unverified',
+    },
     automatic_retry: false,
+    failure_stage:
+      verified && succeeded ? null : !succeeded ? 'child_execution' : 'independent_readback',
+    provider_failure: boundOutcome ? diagnostic(boundOutcome.failure, r) : undefined,
+    item_results: boundOutcome ? results(boundOutcome.results, r) : [],
+    installed_items:
+      boundRead && Array.isArray(boundRead.items)
+        ? boundRead.items.flatMap(v =>
+            object(v) &&
+            r.items.some(i => i.slug === v.slug) &&
+            typeof v.version === 'string' &&
+            /^\d+(?:\.\d+)*$/.test(v.version) &&
+            v.version.length <= 80
+              ? [{ slug: v.slug, version: v.version }]
+              : []
+          )
+        : [],
+    change_reached_site:
+      boundRead?.change_reached_site === true
+        ? true
+        : boundRead?.change_reached_site === false && noReplacementProven(boundRead, r)
+          ? false
+          : 'unknown',
+    installed_state_changed:
+      boundRead && typeof boundRead.installed_state_changed === 'boolean'
+        ? boundRead.installed_state_changed
+        : 'unknown',
+    core_unchanged: boundRead ? boundRead.core_unchanged === true : false,
+    unrelated_unchanged: boundRead ? boundRead.unrelated_unchanged === true : false,
   };
 }
 
