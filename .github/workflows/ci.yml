@@ -32,6 +32,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev
+
       - name: Check formatting
         run: npm run format:check
 
