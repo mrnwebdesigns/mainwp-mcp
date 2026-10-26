@@ -14,6 +14,7 @@ import {
   maintenanceStatus,
   MAINTENANCE_CONTRACT,
   MAINTENANCE_TOOLS,
+  PREPARATION_CONTRACT,
 } from './mrn-maintenance.js';
 import { makeBaseConfig, makeMockLogger } from '../tests/helpers/config.js';
 
@@ -61,6 +62,17 @@ let readLost: boolean;
 let executeMode: 'success' | 'partial' | 'lost';
 let operations: number;
 let receiptPatch: Record<string, unknown>;
+let completionDelay: number;
+let completionPatch: (value: Record<string, unknown>) => Record<string, unknown>;
+let preparations: Map<string, { started: number; result: Record<string, unknown> }>;
+function enableCompletion() {
+  for (const a of catalog.filter(a => names.some(name => a.name === 'mrn-mainwp/' + name)))
+    (a.meta as Record<string, unknown>).mrn_maintenance_preparation_contract = PREPARATION_CONTRACT;
+  const reader = ability('read-maintenance-preflight-v1', false, true);
+  (reader.meta as Record<string, unknown>).mrn_maintenance_preparation_contract =
+    PREPARATION_CONTRACT;
+  catalog.push(reader);
+}
 const call = (
   input: Record<string, unknown> = base,
   name: string = MAINTENANCE_TOOLS[0],
@@ -112,6 +124,9 @@ beforeEach(() => {
   executeMode = 'success';
   operations = 0;
   receiptPatch = {};
+  completionDelay = 0;
+  completionPatch = v => v;
+  preparations = new Map();
   vi.stubGlobal(
     'fetch',
     vi.fn(async (raw: string, options: RequestInit) => {
@@ -130,31 +145,57 @@ beforeEach(() => {
         return new Response(
           JSON.stringify({ ...receipt, status: 'complete', receipt_ttl: 7200, ...receiptPatch })
         );
-      if (name.endsWith('/preflight-maintenance-v1'))
+      if (name.endsWith('/preflight-maintenance-v1')) {
+        const { attempt_id, ...normalized } = input;
+        const result = planPatch({
+          contract: MAINTENANCE_CONTRACT,
+          ready: true,
+          site_id: input.site_id,
+          site_url: input.site_url,
+          kind: input.kind,
+          items: input.items,
+          input_sha256: hash(normalized),
+          plan_sha256: planHash,
+          backup: {
+            provider: 'updraftplus',
+            site_id: input.site_id,
+            nonce: receipt.nonce,
+            receipt_sha256: hash(receipt.receipt),
+            database_only: true,
+            remote_verified: true,
+            completed_at: Date.now() - 1000,
+            expires_at: Date.now() + 600_000,
+          },
+        });
+        if (typeof attempt_id === 'string') {
+          preparations.set(attempt_id, { started: Date.now(), result });
+          if (completionDelay)
+            return new Promise((_resolve, reject) => {
+              options.signal?.addEventListener('abort', () =>
+                reject(new DOMException('', 'AbortError'))
+              );
+            });
+          return new Response(JSON.stringify({ ...result, preparation_id: attempt_id }));
+        }
+        return new Response(JSON.stringify(result));
+      }
+      if (name.endsWith('/read-maintenance-preflight-v1')) {
+        const { attempt_id } = input;
+        const saved = preparations.get(String(attempt_id));
+        const complete = saved && Date.now() - saved.started >= completionDelay;
         return new Response(
           JSON.stringify(
-            planPatch({
-              contract: MAINTENANCE_CONTRACT,
-              ready: true,
-              site_id: input.site_id,
-              site_url: input.site_url,
-              kind: input.kind,
-              items: input.items,
-              input_sha256: hash(input),
-              plan_sha256: planHash,
-              backup: {
-                provider: 'updraftplus',
-                site_id: input.site_id,
-                nonce: receipt.nonce,
-                receipt_sha256: hash(receipt.receipt),
-                database_only: true,
-                remote_verified: true,
-                completed_at: Date.now() - 1000,
-                expires_at: Date.now() + 600_000,
-              },
+            completionPatch({
+              contract: PREPARATION_CONTRACT,
+              attempt_id,
+              input_sha256: input.input_sha256,
+              status: complete ? 'complete' : 'pending',
+              result: complete ? saved.result : null,
+              error: null,
             })
           )
         );
+      }
       if (name.endsWith('/execute-maintenance-v1')) {
         operations++;
         if (executeMode === 'lost') throw Error('simulated response loss');
@@ -198,6 +239,152 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+describe('bounded original preparation recovery', () => {
+  it('binds each immediate preparation and confirmation to a fresh private attempt', async () => {
+    enableCompletion();
+    await issued();
+    const result = await confirmed();
+    expect(body(result).status).toBe('VERIFIED');
+    const prepared = requests.filter(r => r.name.endsWith('/preflight-maintenance-v1'));
+    expect(prepared).toHaveLength(2);
+    expect(prepared[0].input.attempt_id).not.toBe(prepared[1].input.attempt_id);
+    expect(writes()[0].input.attempt_id).toBe(prepared[1].input.attempt_id);
+    expect(writes()).toHaveLength(1);
+    expect(operations).toBe(1);
+  });
+
+  it('recovers the original 157-second preparation after the 90-second HTTP abort', async () => {
+    vi.useFakeTimers();
+    enableCompletion();
+    completionDelay = 157_274;
+    await issued();
+    let settled = false;
+    const pending = call().then(result => {
+      settled = true;
+      return result;
+    });
+    await vi.waitFor(() => expect(preparations.size).toBe(1));
+    await vi.advanceTimersByTimeAsync(91_000);
+    expect(settled).toBe(false);
+    expect(writes()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(70_000);
+    const result = await pending;
+    expect(result.isError).not.toBe(true);
+    expect(body(result).status).toBe('CONFIRMATION_REQUIRED');
+    expect(requests.filter(r => r.name.endsWith('/preflight-maintenance-v1'))).toHaveLength(1);
+    const reads = requests.filter(r => r.name.endsWith('/read-maintenance-preflight-v1'));
+    expect(reads.length).toBeGreaterThan(1);
+    expect(new Set(reads.map(r => r.input.attempt_id)).size).toBe(1);
+    expect(reads[0].input.attempt_id).toBe([...preparations.keys()][0]);
+    expect(reads.every(r => !('backup_receipt' in r.input) && !('items' in r.input))).toBe(true);
+    for (const [url] of vi
+      .mocked(fetch)
+      .mock.calls.filter(([url]) => String(url).includes('/read-maintenance-preflight-v1/'))) {
+      expect(String(url)).not.toContain(receipt.receipt);
+      expect(String(url)).not.toContain(receipt.nonce);
+    }
+    expect(writes()).toEqual([]);
+  });
+
+  it.each(['attempt_id', 'input_sha256', 'contract'])(
+    'refuses a mismatched recovery %s',
+    async field => {
+      vi.useFakeTimers();
+      enableCompletion();
+      completionDelay = 1;
+      completionPatch = v => ({ ...v, [field]: 'foreign' });
+      await issued();
+      const pending = call();
+      await vi.waitFor(() => expect(preparations.size).toBe(1));
+      await vi.advanceTimersByTimeAsync(90_001);
+      expect(body(await pending).error.data).toMatchObject({
+        code: 'preparation_binding',
+        execution_attempted: false,
+        automatic_retry: false,
+      });
+      expect(writes()).toEqual([]);
+    }
+  );
+
+  it('cannot turn pending metadata into a prepared plan', async () => {
+    vi.useFakeTimers();
+    enableCompletion();
+    completionDelay = 1;
+    completionPatch = v => ({ ...v, status: 'pending' });
+    await issued();
+    const pending = call();
+    await vi.waitFor(() => expect(preparations.size).toBe(1));
+    await vi.advanceTimersByTimeAsync(90_001);
+    expect(body(await pending).error.data.code).toBe('preparation_contract');
+    expect(writes()).toEqual([]);
+  });
+
+  it('stops bounded pending reads without restarting preparation or dispatching an update', async () => {
+    vi.useFakeTimers();
+    enableCompletion();
+    completionDelay = Infinity;
+    await issued();
+    const pending = call();
+    await vi.waitFor(() => expect(preparations.size).toBe(1));
+    await vi.advanceTimersByTimeAsync(240_001);
+    expect(body(await pending).error.data).toMatchObject({
+      code: 'preparation_wait_expired',
+      execution_attempted: false,
+      automatic_retry: false,
+    });
+    expect(requests.filter(r => r.name.endsWith('/preflight-maintenance-v1'))).toHaveLength(1);
+    expect(writes()).toEqual([]);
+  });
+
+  it('honors cancellation during recovery without retrying work', async () => {
+    vi.useFakeTimers();
+    enableCompletion();
+    completionDelay = Infinity;
+    await issued();
+    const controller = new AbortController();
+    const pending = executeTool(config, MAINTENANCE_TOOLS[0], base, logger, {
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(preparations.size).toBe(1));
+    await vi.advanceTimersByTimeAsync(91_000);
+    controller.abort();
+    expect((await pending).isError).toBe(true);
+    expect(writes()).toEqual([]);
+    expect(requests.filter(r => r.name.endsWith('/preflight-maintenance-v1'))).toHaveLength(1);
+  });
+
+  it.each(['missing', 'blocked', 'nonreadonly', 'wrong_contract'])(
+    'refuses a %s companion instead of silently using legacy transport',
+    async mode => {
+      enableCompletion();
+      const helper = catalog.at(-1)!;
+      if (mode === 'missing') catalog.pop();
+      if (mode === 'nonreadonly') helper.meta!.annotations!.readonly = false;
+      if (mode === 'wrong_contract')
+        (helper.meta as Record<string, unknown>).mrn_maintenance_preparation_contract = 'wrong';
+      const c =
+        mode === 'blocked'
+          ? { ...config, blockedTools: ['mrn_mainwp__read_maintenance_preflight_v1'] }
+          : config;
+      await issued();
+      expect((await call(base, MAINTENANCE_TOOLS[0], c)).isError).toBe(true);
+      expect(requests.filter(r => r.name.endsWith('/preflight-maintenance-v1'))).toEqual([]);
+      expect(writes()).toEqual([]);
+    }
+  );
+
+  it('does not retry a lost execute response even with completion recovery enabled', async () => {
+    enableCompletion();
+    await issued();
+    executeMode = 'lost';
+    const result = body(await confirmed());
+    expect(result.status).toBe('OUTCOME_UNKNOWN');
+    expect(result.automatic_retry).toBe(false);
+    expect(operations).toBe(1);
+    expect(writes()).toHaveLength(1);
+  });
 });
 
 describe('MRN maintenance through the public executor', () => {
