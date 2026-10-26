@@ -13,6 +13,9 @@ export const MAINTENANCE_TOOLS = [
   'mrn_mainwp__maintenance_themes_v1',
 ] as const;
 export const MAINTENANCE_CONTRACT = 'mrn-maintenance-exact-versions-remote-updraft-v1';
+export const PREPARATION_CONTRACT = 'mrn-maintenance-preparation-completion-v1';
+const PREPARATION_READ = 'read-maintenance-preflight-v1';
+const PREPARATION_WAIT = 240_000;
 const PREFIX = 'mrn-mainwp/';
 const PROVIDERS = [
   'preflight-maintenance-v1',
@@ -580,6 +583,26 @@ function qualifiedMaintenanceProvider(config: Config, all: Ability[]): Ability[]
   // A blocked helper is an explicit denial even though helpers are not public tools.
   if (PROVIDERS.some(n => config.blockedTools?.includes('mrn_mainwp__' + n.replaceAll('-', '_'))))
     return;
+  const recovery = all.find(a => a.name === PREFIX + PREPARATION_READ);
+  const preparationMeta = (a: Ability) =>
+    (a.meta as Record<string, unknown> | undefined)?.mrn_maintenance_preparation_contract;
+  // A partially installed or explicitly blocked completion contract is not a legacy provider.
+  if (recovery || (providers as Ability[]).some(a => preparationMeta(a) !== undefined)) {
+    if (
+      !recovery ||
+      (recovery.meta as Record<string, unknown> | undefined)?.mrn_maintenance_contract !==
+        MAINTENANCE_CONTRACT ||
+      config.blockedTools?.includes('mrn_mainwp__read_maintenance_preflight_v1') ||
+      [...(providers as Ability[]), recovery].some(
+        a => preparationMeta(a) !== PREPARATION_CONTRACT
+      ) ||
+      recovery.meta?.annotations?.readonly !== true ||
+      recovery.meta?.annotations?.destructive !== false ||
+      recovery.meta?.annotations?.idempotent !== true
+    )
+      return;
+    return [...(providers as Ability[]), recovery];
+  }
   return providers as Ability[];
 }
 
@@ -589,7 +612,8 @@ export function maintenanceStatus(
 ): Record<string, unknown> | undefined {
   const tools = maintenanceTools(config).map(t => t.name);
   if (!tools.length) return;
-  const ready = !!qualifiedMaintenanceProvider(config, abilities);
+  const providers = qualifiedMaintenanceProvider(config, abilities);
+  const ready = !!providers;
   return {
     contract: MAINTENANCE_CONTRACT,
     tools,
@@ -597,8 +621,114 @@ export function maintenanceStatus(
     execution_ready: ready && !config.safeMode && config.requireUserConfirmation,
     core_enabled: false,
     stock_update_fallback: false,
+    ...(providers?.length === 4 ? { preparation_recovery_ready: true } : {}),
     ...(!ready ? { blocker: 'MAINTENANCE_PROVIDER_REQUIRED' } : {}),
   };
+}
+
+/** Read only the original attempt after a lost preparation response; never resend work. */
+async function recoverPreparation(
+  config: Config,
+  helper: Ability,
+  request: Request,
+  attempt: string,
+  started: number,
+  approvalDeadline: number | undefined,
+  logger: Logger,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const deadline = Math.min(
+    started + PREPARATION_WAIT,
+    performance.now() +
+      (receipts.get(identity(config, request.backup_receipt))!.expires - Date.now()),
+    approvalDeadline === undefined ? Infinity : performance.now() + approvalDeadline - Date.now()
+  );
+  const refuse = (code: string): never => {
+    throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
+      stage: 'dashboard_preparation_read',
+      code,
+      input_sha256: sha(request),
+      elapsed_ms: Math.max(0, Math.round(performance.now() - started)),
+      execution_attempted: false,
+      automatic_retry: false,
+    });
+  };
+  while (performance.now() < deadline) {
+    if (signal?.aborted) return refuse('preparation_cancelled');
+    receiptValid(config, request.backup_receipt);
+    let result: unknown;
+    try {
+      result = await executeAbility(
+        {
+          ...config,
+          requestTimeout: Math.max(1, Math.min(10_000, deadline - performance.now())),
+          retryEnabled: false,
+        },
+        helper.name,
+        {
+          kind: request.kind,
+          site_id: request.site_id,
+          site_url: request.site_url,
+          attempt_id: attempt,
+          input_sha256: sha(request),
+        },
+        logger,
+        helper,
+        signal
+      );
+    } catch (error) {
+      throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
+        ...upstreamFailure(error, 'dashboard_preflight', started, 10_000),
+        stage: 'dashboard_preparation_read',
+        input_sha256: sha(request),
+      });
+    }
+    if (
+      !object(result) ||
+      !exactKeys(result, ['contract', 'attempt_id', 'input_sha256', 'status', 'result', 'error']) ||
+      Object.keys(result).length !== 6 ||
+      result.contract !== PREPARATION_CONTRACT ||
+      result.attempt_id !== attempt ||
+      result.input_sha256 !== sha(request)
+    )
+      return refuse('preparation_binding');
+    if (result.status === 'complete') {
+      if (
+        !object(result.result) ||
+        result.error !== null ||
+        result.result.preparation_id !== undefined
+      )
+        return refuse('preparation_contract');
+      return { ...result.result, preparation_id: attempt };
+    }
+    if (result.status === 'failed') {
+      if (
+        result.result !== null ||
+        typeof result.error !== 'string' ||
+        !/^mrn_maintenance_[a-z_]{1,64}$/.test(result.error)
+      )
+        return refuse('preparation_contract');
+      return refuse(result.error);
+    }
+    if (result.status !== 'pending' || result.result !== null || result.error !== null)
+      return refuse('preparation_contract');
+    await new Promise<void>((resolve, reject) => {
+      const aborted = () => {
+        clearTimeout(timer);
+        reject(new Error('MAINTENANCE_CANCELLED'));
+      };
+      const timer = setTimeout(
+        () => {
+          signal?.removeEventListener('abort', aborted);
+          resolve();
+        },
+        Math.max(1, Math.min(3_000, deadline - performance.now()))
+      );
+      signal?.addEventListener('abort', aborted, { once: true });
+      if (signal?.aborted) aborted();
+    });
+  }
+  return refuse('preparation_wait_expired');
 }
 
 function checkPlan(value: unknown, request: Request): { plan: string; expires: number } {
@@ -680,6 +810,7 @@ export async function executeMaintenance(
     return fail(
       'MAINTENANCE_PROVIDER_REQUIRED: Dashboard must validate remote Updraft receipts and atomically bind exact child versions. Stock updates are not a safe fallback.'
     );
+  const attempt = provider[3] ? crypto.randomUUID() : undefined;
   let phaseStarted = performance.now();
   const timeout = (i: number) => Math.max(config.requestTimeout, PHASE_TIMEOUTS[i]);
   const run = (i: number, input: Record<string, unknown>) => {
@@ -695,13 +826,33 @@ export async function executeMaintenance(
   };
   let rawPlan: unknown;
   try {
-    rawPlan = await run(0, r);
+    rawPlan = await run(0, { ...r, ...(attempt ? { attempt_id: attempt } : {}) });
   } catch (error) {
-    throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
-      ...upstreamFailure(error, 'dashboard_preflight', phaseStarted, timeout(0)),
-      input_sha256: sha(r),
-    });
+    const failure = upstreamFailure(error, 'dashboard_preflight', phaseStarted, timeout(0));
+    if (
+      attempt &&
+      !signal?.aborted &&
+      ['provider_request_timeout', 'provider_gateway_timeout'].includes(String(failure.code))
+    ) {
+      rawPlan = await recoverPreparation(
+        config,
+        provider[3],
+        r,
+        attempt,
+        phaseStarted,
+        pending?.expires,
+        logger,
+        signal
+      );
+    } else {
+      throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
+        ...failure,
+        input_sha256: sha(r),
+      });
+    }
   }
+  if (attempt && (!object(rawPlan) || rawPlan.preparation_id !== attempt))
+    fail('MAINTENANCE_PREPARATION_BINDING');
   if (object(rawPlan) && rawPlan.contract === MAINTENANCE_CONTRACT && rawPlan.ready === false)
     throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
       failure: diagnostic(rawPlan.failure, r) ?? {
@@ -779,6 +930,7 @@ export async function executeMaintenance(
       plan_sha256: plan.plan,
       request_id: pending.requestId,
       confirm: true,
+      ...(attempt ? { attempt_id: attempt } : {}),
     });
   } catch (error) {
     return {

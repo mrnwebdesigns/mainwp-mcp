@@ -11,6 +11,39 @@ and a successful native preflight. This is not fleet-wide Child qualification
 or proof of an executed maintenance update. Site adoption and maintenance
 execution remain separate authorized operations.
 
+## Slow preparation completion (provider 0.13.12)
+
+The October 26 Banks diagnostic measured a successful full native sync taking
+143.496 seconds, followed by 13.682 seconds of native child inspection. The local
+90-second preflight HTTP budget expires before that work completes. A longer
+single HTTP wait also encounters an intermediary gateway timeout. This is
+distinct from the Cloudflare rule that blocked the Dashboard ZIP upload.
+
+The matching private `mrn-maintenance-preparation-completion-v1` contract permits
+bounded, read-only recovery of the **original** attempt. Each preview and
+confirmation revalidation gets a new UUID. Only local request/gateway timeouts
+allow polling; authentication, permission and contract errors remain failures.
+Each GET sends only exact identity, UUID and normalized input digest. Backup
+receipt plaintext never enters the URL. Server owner, site, receipt lifetime,
+attempt and request bindings must still validate. Pending/failed/corrupt/foreign
+results confer no authority. The original preflight is never resent.
+
+Per-request HTTP budgets are unchanged. Recovery ends no later than four minutes
+from preparation start and respects earlier cancellation, backup and confirmation
+expiry. A completed result passes the existing exact-plan and stale-state checks.
+The server then requires its exact, single-use confirmation preparation to have
+completed within fifteen seconds, rechecks current holds/versions and existing
+receipt/permission/approval gates, and retains native child preinstall checks and
+independent readback. This avoids repeating the already completed full sync in
+the same transaction. Diagnostic timestamps and general sync caches are not used.
+
+A lost or unverified execute response still stops without retrying a write. No
+new public tool, stock fallback, credential, namespace or allowlist entry is
+introduced. A partially advertised or blocked completion contract is refused;
+older providers retain their existing transport and refusal behavior. Source
+qualification, Dashboard installation, global pin activation, refreshed chat
+discovery and approved live verification remain separate evidence.
+
 ## Provenance and policy
 
 The October 12 code-edit pilot constructed the allowlist from read tools and
