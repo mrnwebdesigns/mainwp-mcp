@@ -6,7 +6,7 @@ import type { Config } from './config.js';
 import type { Logger } from './logging.js';
 import { decidePolicy, isToolAllowed } from './policy.js';
 import { validateInput } from './security.js';
-import { McpErrorFactory, UpstreamHttpError } from './errors.js';
+import { getHttpStatus, McpErrorFactory, UpstreamHttpError } from './errors.js';
 
 export const MAINTENANCE_TOOLS = [
   'mrn_mainwp__maintenance_plugins_v1',
@@ -206,14 +206,70 @@ function fingerprints(value: unknown): Record<string, string> | undefined {
     return;
   return value as Record<string, string>;
 }
-function upstreamFailure(error: unknown, stage: string): Record<string, unknown> {
+function upstreamFailure(
+  error: unknown,
+  stage: string,
+  started: number,
+  timeout: number
+): Record<string, unknown> {
+  const status = getHttpStatus(error);
+  const httpStatus =
+    Number.isInteger(status) && status! >= 300 && status! <= 599 ? status : undefined;
+  // Inspect only typed local transport fields, never reflect a remote message,
+  // URL, response body, header, receipt or arbitrary exception code.
+  const cause = object(error) && object(error.cause) ? error.cause : undefined;
+  const transportCode = object(error) ? (error.code ?? cause?.code) : undefined;
+  let code = 'provider_transport_failed';
+  if (
+    error instanceof UpstreamHttpError &&
+    /^mrn_maintenance_[a-z_]{1,64}$/.test(error.upstreamCode ?? '')
+  ) {
+    code = error.upstreamCode!;
+  } else if (
+    transportCode === 'ETIMEDOUT' ||
+    (error instanceof Error && error.name === 'TimeoutError')
+  ) {
+    code = 'provider_request_timeout';
+  } else if (error instanceof Error && error.name === 'AbortError') {
+    code = 'provider_request_cancelled';
+  } else if (httpStatus === 524 || httpStatus === 504) {
+    code = 'provider_gateway_timeout';
+  } else if (httpStatus === 401) {
+    code = 'provider_authentication_rejected';
+  } else if (httpStatus === 403) {
+    code = 'provider_http_forbidden';
+  } else if (httpStatus === 429) {
+    code = 'provider_rate_limited';
+  } else if (httpStatus !== undefined && httpStatus < 400) {
+    code = 'provider_redirect_refused';
+  } else if (httpStatus !== undefined) {
+    code = 'provider_http_error';
+  } else if (['ENOTFOUND', 'EAI_AGAIN'].includes(String(transportCode))) {
+    code = 'provider_dns_failed';
+  } else if (
+    ['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(transportCode))
+  ) {
+    code = 'provider_connection_failed';
+  } else if (
+    [
+      'CERT_HAS_EXPIRED',
+      'DEPTH_ZERO_SELF_SIGNED_CERT',
+      'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+      'ERR_TLS_CERT_ALTNAME_INVALID',
+      'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+    ].includes(String(transportCode))
+  ) {
+    code = 'provider_tls_failed';
+  } else if (error instanceof Error && error.message === 'Invalid JSON in ability response') {
+    code = 'provider_invalid_response';
+  }
   return {
     stage,
-    code:
-      error instanceof UpstreamHttpError &&
-      /^mrn_maintenance_[a-z_]{1,64}$/.test(error.upstreamCode ?? '')
-        ? error.upstreamCode
-        : 'provider_transport_or_contract',
+    code,
+    ...(httpStatus === undefined ? {} : { http_status: httpStatus }),
+    timeout_ms: timeout,
+    elapsed_ms: Math.max(0, Math.round(performance.now() - started)),
+    ...(stage === 'dashboard_preflight' ? { execution_attempted: false } : {}),
     automatic_retry: false,
   };
 }
@@ -624,23 +680,27 @@ export async function executeMaintenance(
     return fail(
       'MAINTENANCE_PROVIDER_REQUIRED: Dashboard must validate remote Updraft receipts and atomically bind exact child versions. Stock updates are not a safe fallback.'
     );
-  const run = (i: number, input: Record<string, unknown>) =>
-    executeAbility(
-      { ...config, requestTimeout: Math.max(config.requestTimeout, PHASE_TIMEOUTS[i]) },
+  let phaseStarted = performance.now();
+  const timeout = (i: number) => Math.max(config.requestTimeout, PHASE_TIMEOUTS[i]);
+  const run = (i: number, input: Record<string, unknown>) => {
+    phaseStarted = performance.now();
+    return executeAbility(
+      { ...config, requestTimeout: timeout(i) },
       provider[i].name,
       input,
       logger,
       provider[i],
       signal
     );
+  };
   let rawPlan: unknown;
   try {
     rawPlan = await run(0, r);
   } catch (error) {
-    throw McpErrorFactory.invalidParams(
-      'MAINTENANCE_PREFLIGHT_FAILED',
-      upstreamFailure(error, 'dashboard_preflight')
-    );
+    throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
+      ...upstreamFailure(error, 'dashboard_preflight', phaseStarted, timeout(0)),
+      input_sha256: sha(r),
+    });
   }
   if (object(rawPlan) && rawPlan.contract === MAINTENANCE_CONTRACT && rawPlan.ready === false)
     throw McpErrorFactory.invalidParams('MAINTENANCE_PREFLIGHT_FAILED', {
@@ -730,7 +790,7 @@ export async function executeMaintenance(
       plan_sha256: plan.plan,
       request_id: pending.requestId,
       automatic_retry: false,
-      failure: upstreamFailure(error, 'dashboard_execute'),
+      failure: upstreamFailure(error, 'dashboard_execute', phaseStarted, timeout(1)),
       change_reached_site: 'unknown',
       message:
         'The request may have reached the child. Inspect installed state and provider operation status; do not repeat the write.',
@@ -764,7 +824,7 @@ export async function executeMaintenance(
       plan_sha256: plan.plan,
       request_id: pending.requestId,
       automatic_retry: false,
-      failure: upstreamFailure(error, 'independent_readback'),
+      failure: upstreamFailure(error, 'independent_readback', phaseStarted, timeout(2)),
       provider_result: boundOutcome ? diagnostic(boundOutcome.failure, r) : undefined,
       item_results: boundOutcome ? results(boundOutcome.results, r) : [],
       change_reached_site: 'unknown',
