@@ -228,6 +228,26 @@ requested items and refuse the entire write if any fails. Dashboard ignored or
 missing selections remain refused. No URL, exception message or native log is
 included in these diagnostics.
 
+Transport failures are distinct from provider qualification and plan validation.
+The response retains the phase, fixed timeout and observed elapsed milliseconds:
+`provider_request_timeout`, `provider_request_cancelled`,
+`provider_gateway_timeout`, `provider_authentication_rejected`,
+`provider_http_forbidden`, `provider_rate_limited`, `provider_redirect_refused`,
+`provider_http_error`, `provider_dns_failed`, `provider_connection_failed`,
+`provider_tls_failed`, `provider_invalid_response` or `provider_transport_failed`.
+An HTTP failure includes only its numeric status, never its response body.
+Validated `mrn_maintenance_*` server refusals retain their original code.
+Preflight transport failures state `execution_attempted: false`; execution or
+readback failures still retain an unknown outcome and never trigger a retry.
+The preflight error also supplies `input_sha256`, binding the normalized request
+to optional same-connection Dashboard phase diagnostics without returning input
+or receipt plaintext. Those diagnostics are observations only, never sync proof.
+The 90/180/90-second phase ceilings, cancellation, exact plan confirmation,
+backup and independent readback requirements are unchanged. A timeout may leave
+read-only preparation running upstream. Do not infer completed preparation from
+a newer inventory timestamp, or skip the provider's required sync to work around
+it. Capability discovery alone does not prove a working live maintenance path.
+
 Execution results separate the Dashboard response, child execution and independent
 readback. Per-item results name the stage/code and whether destination processing
 started; later items explicitly report `not_attempted`. `installed_items` is fresh

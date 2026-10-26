@@ -308,6 +308,90 @@ describe('MRN maintenance through the public executor', () => {
     });
     expect(writes()).toHaveLength(0);
   });
+  it.each([
+    ['ETIMEDOUT', 'provider_request_timeout'],
+    ['ENOTFOUND', 'provider_dns_failed'],
+    ['ECONNREFUSED', 'provider_connection_failed'],
+    ['CERT_HAS_EXPIRED', 'provider_tls_failed'],
+    ['private-unrecognized-code', 'provider_transport_failed'],
+  ])(
+    'classifies typed preflight transport failure %s without reflecting secrets',
+    async (code, expected) => {
+      await issued();
+      const fixture = vi.mocked(fetch).getMockImplementation()!;
+      let attempts = 0;
+      vi.mocked(fetch).mockImplementation((raw, options) => {
+        if (!String(raw).includes('/preflight-maintenance-v1/run')) return fixture(raw, options);
+        attempts++;
+        throw Object.assign(new TypeError(receipt.receipt), { cause: { code } });
+      });
+      const response = await call();
+      expect(body(response).error).toMatchObject({
+        message: 'MAINTENANCE_PREFLIGHT_FAILED',
+        data: {
+          stage: 'dashboard_preflight',
+          code: expected,
+          timeout_ms: 90_000,
+          execution_attempted: false,
+          automatic_retry: false,
+        },
+      });
+      expect(JSON.stringify(response)).not.toContain(receipt.receipt);
+      expect(JSON.stringify(response)).not.toContain('private-unrecognized-code');
+      expect(body(response).error.data.input_sha256).toBe(
+        hash({
+          kind: 'plugin',
+          site_id: base.site_id,
+          site_url: base.site_url,
+          items: base.items,
+          major_overrides: [],
+          backup_receipt: receipt,
+        })
+      );
+      expect(attempts).toBe(1);
+      expect(writes()).toEqual([]);
+    }
+  );
+  it.each([
+    [401, 'provider_authentication_rejected'],
+    [403, 'provider_http_forbidden'],
+    [429, 'provider_rate_limited'],
+    [502, 'provider_http_error'],
+    [504, 'provider_gateway_timeout'],
+    [524, 'provider_gateway_timeout'],
+  ])('reports preflight HTTP %s without reflecting the upstream body', async (status, expected) => {
+    await issued();
+    const fixture = vi.mocked(fetch).getMockImplementation()!;
+    let attempts = 0;
+    vi.mocked(fetch).mockImplementation((raw, options) => {
+      if (!String(raw).includes('/preflight-maintenance-v1/run')) return fixture(raw, options);
+      attempts++;
+      return Promise.resolve(new Response(receipt.receipt, { status }));
+    });
+    const response = await call();
+    expect(body(response).error.data).toMatchObject({
+      code: expected,
+      http_status: status,
+      execution_attempted: false,
+      automatic_retry: false,
+    });
+    expect(JSON.stringify(response)).not.toContain(receipt.receipt);
+    expect(attempts).toBe(1);
+    expect(writes()).toEqual([]);
+  });
+  it('distinguishes a malformed provider response from transport and qualified-contract failures', async () => {
+    await issued();
+    const fixture = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((raw, options) =>
+      String(raw).includes('/preflight-maintenance-v1/run')
+        ? Promise.resolve(new Response('<html>' + receipt.receipt + '</html>'))
+        : fixture(raw, options)
+    );
+    const response = await call();
+    expect(body(response).error.data.code).toBe('provider_invalid_response');
+    expect(JSON.stringify(response)).not.toContain(receipt.receipt);
+    expect(writes()).toEqual([]);
+  });
   it('distinguishes failed child preinstall with unchanged installed state', async () => {
     await issued();
     executeMode = 'partial';
@@ -572,7 +656,15 @@ describe('MRN maintenance through the public executor', () => {
     await vi.advanceTimersByTimeAsync(30_001);
     expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(JSON.stringify(body(await pending))).toContain('MAINTENANCE_PREFLIGHT_FAILED');
+    expect(body(await pending).error).toMatchObject({
+      message: 'MAINTENANCE_PREFLIGHT_FAILED',
+      data: {
+        code: 'provider_request_timeout',
+        timeout_ms: 90_000,
+        execution_attempted: false,
+        automatic_retry: false,
+      },
+    });
     expect(preflights).toBe(1);
     expect(writes()).toEqual([]);
   });
@@ -596,7 +688,9 @@ describe('MRN maintenance through the public executor', () => {
     });
     await vi.waitFor(() => expect(started).toBe(true));
     controller.abort();
-    expect((await pending).isError).toBe(true);
+    const response = await pending;
+    expect(response.isError).toBe(true);
+    expect(body(response).error.data.code).toBe('provider_request_cancelled');
     expect(writes()).toEqual([]);
   });
   it.each(['failed', 'running', 'pending'])('does not trust a %s backup response', async status => {
