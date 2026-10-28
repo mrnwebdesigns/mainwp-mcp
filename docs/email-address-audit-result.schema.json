@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mrn:mainwp:email-address-audit:results:v1",
+  "title": "MRN email address audit JSON export",
+  "type": "object",
+  "properties": {
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sites": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/site_result"
+      }
+    }
+  },
+  "required": ["summary", "created_at", "sites"],
+  "additionalProperties": false,
+  "$defs": {
+    "match": {
+      "type": "object",
+      "properties": {
+        "site_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "site_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "component": {
+          "type": "string"
+        },
+        "form_id": {
+          "type": ["integer", "string", "null"]
+        },
+        "form_title": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "setting_path": {
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "recipient",
+            "sender",
+            "reply_to",
+            "account",
+            "admin_notification",
+            "other_reference"
+          ]
+        },
+        "match_type": {
+          "enum": ["direct", "inherited"]
+        },
+        "enabled_state": {
+          "enum": [
+            "current",
+            "disabled",
+            "inactive_plugin",
+            "draft",
+            "pending",
+            "cached",
+            "historical",
+            "unknown"
+          ]
+        },
+        "address": {
+          "type": "string",
+          "format": "email"
+        },
+        "inspection_timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "site_id",
+        "site_url",
+        "component",
+        "form_id",
+        "form_title",
+        "setting_path",
+        "role",
+        "match_type",
+        "enabled_state",
+        "address",
+        "inspection_timestamp"
+      ],
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "properties": {
+        "audit_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "address": {
+          "type": "string",
+          "format": "email"
+        },
+        "scope": {
+          "enum": ["site", "sites", "fleet"]
+        },
+        "inventory_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inspected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "matched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "current_matched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unmatched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "incomplete": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "finished": {
+          "type": "boolean"
+        },
+        "matching_sites": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "site_id": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "site_url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "matches": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "current_matches": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "coverage_complete": {
+                "type": "boolean"
+              }
+            },
+            "required": ["site_id", "site_url", "matches", "current_matches", "coverage_complete"],
+            "additionalProperties": false
+          }
+        },
+        "counts_note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "audit_id",
+        "address",
+        "scope",
+        "inventory_total",
+        "total",
+        "inspected",
+        "matched",
+        "current_matched",
+        "unmatched",
+        "incomplete",
+        "failed",
+        "pending",
+        "finished",
+        "matching_sites",
+        "counts_note"
+      ],
+      "additionalProperties": false
+    },
+    "site_result": {
+      "type": "object",
+      "properties": {
+        "site_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "site_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "status": {
+          "enum": ["pending", "inspecting", "complete", "failed"]
+        },
+        "pages": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sync": {
+          "enum": ["not_attempted", "dispatched", "returned", "timeout_or_refused", "verified"]
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "error_code": {
+          "type": "string",
+          "pattern": "^EMAIL_AUDIT_[A-Z_]+$"
+        },
+        "inspected_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "coverage": {
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string"
+            },
+            "limitations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "plugin_inventory": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "version": {
+                    "type": "string"
+                  },
+                  "active": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["version", "active"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["scope", "limitations"],
+          "additionalProperties": false
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/match"
+          }
+        }
+      },
+      "required": ["site_id", "site_url", "status", "pages", "sync", "limitations", "matches"],
+      "additionalProperties": false
+    }
+  }
+}

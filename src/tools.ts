@@ -47,6 +47,7 @@ import {
   executeMaintenance,
   observeMaintenanceReceipt,
 } from './mrn-maintenance.js';
+import { emailAuditTools, EMAIL_AUDIT_TOOLS, executeEmailAudit } from './mrn-email-audit.js';
 
 /**
  * Options for tool execution
@@ -140,7 +141,7 @@ export async function getTools(config: Config, logger?: Logger): Promise<Tool[]>
 
   // Apply allowlist filter (whitelist)
   tools = tools.filter(tool => isToolAllowed(config, tool.name));
-  const localTools = maintenanceTools(config);
+  const localTools = [...maintenanceTools(config), ...emailAuditTools(config)];
   if (localTools.some(local => tools.some(remote => remote.name === local.name))) {
     throw McpErrorFactory.permissionDenied('MRN local maintenance tool name collision');
   }
@@ -233,6 +234,13 @@ export async function executeTool(
           ? { isError: true }
           : {}),
       };
+    }
+
+    if ((EMAIL_AUDIT_TOOLS as readonly string[]).includes(toolName)) {
+      const result = await executeEmailAudit(config, toolName, args, reqLogger, options?.signal);
+      const text = formatJson(config, result);
+      trackSessionData(text, config, reqLogger, 'for MRN email audit response');
+      return { content: [{ type: 'text', text }] };
     }
 
     // Resolve tool name → ability via the cache reverse index built during
