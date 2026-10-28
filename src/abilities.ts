@@ -335,6 +335,7 @@ export interface Ability {
   input_schema?: Record<string, unknown>;
   output_schema?: Record<string, unknown>;
   meta?: {
+    mrn_email_audit_contract?: unknown;
     show_in_rest?: boolean;
     annotations?: AbilityAnnotations;
   };
@@ -1010,6 +1011,72 @@ function serializeToPhpQueryString(input: Record<string, unknown>, schema: unkno
   return params.length > 0 ? '?' + params.join('&') : '';
 }
 
+/** Closed, read-only ACL contract; all other nested query inputs remain refused. */
+function emailAuditAuthorizationQuery(
+  ability: Ability,
+  input: Record<string, unknown>
+): string | undefined {
+  if (
+    ability.name !== 'mrn-mainwp/authorize-email-address-audit-v1' ||
+    ability.meta?.annotations?.readonly !== true ||
+    ability.meta.annotations.destructive !== false ||
+    ability.meta.annotations.idempotent !== true ||
+    ability.meta.mrn_email_audit_contract !== 'mrn-email-address-audit-v1'
+  )
+    return undefined;
+  const invalid = (): never => {
+    throw McpErrorFactory.invalidParams('EMAIL_AUDIT_AUTHORIZATION_INPUT');
+  };
+  if (
+    !isPlainSchemaObject(input) ||
+    Object.keys(input).join(',') !== 'sites' ||
+    !Array.isArray(input.sites) ||
+    input.sites.length < 1 ||
+    input.sites.length > 20
+  )
+    invalid();
+  const ids = new Set<number>();
+  const urls = new Set<string>();
+  const params: string[] = [];
+  for (const [index, site] of (input.sites as unknown[]).entries()) {
+    if (
+      !isPlainSchemaObject(site) ||
+      Object.keys(site).length !== 2 ||
+      !Object.hasOwn(site, 'site_id') ||
+      !Object.hasOwn(site, 'site_url') ||
+      !Number.isSafeInteger(site.site_id) ||
+      Number(site.site_id) < 1 ||
+      typeof site.site_url !== 'string' ||
+      site.site_url.length > 512
+    )
+      invalid();
+    const record = site as { site_id: number; site_url: string };
+    let parsed: URL;
+    try {
+      parsed = new URL(record.site_url);
+    } catch {
+      return invalid();
+    }
+    if (
+      !['https:', 'http:'].includes(parsed.protocol) ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash ||
+      ids.has(record.site_id) ||
+      urls.has(record.site_url)
+    )
+      invalid();
+    ids.add(record.site_id);
+    urls.add(record.site_url);
+    params.push(
+      `input[sites][${index}][site_id]=${record.site_id}`,
+      `input[sites][${index}][site_url]=${encodeURIComponent(record.site_url)}`
+    );
+  }
+  return '?' + params.join('&');
+}
+
 function isPlainSchemaObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -1201,8 +1268,9 @@ export async function executeAbility(
         }
       } else {
         queryString =
-          serializeToPhpQueryString(input ?? {}, ability.input_schema) ||
-          (hasInputSchema && !hasSchemaDefault ? '?input=' : '');
+          emailAuditAuthorizationQuery(ability, input ?? {}) ??
+          (serializeToPhpQueryString(input ?? {}, ability.input_schema) ||
+            (hasInputSchema && !hasSchemaDefault ? '?input=' : ''));
       }
       const fullUrl = url + queryString;
       if (fullUrl.length > MAX_URL_LENGTH) {
