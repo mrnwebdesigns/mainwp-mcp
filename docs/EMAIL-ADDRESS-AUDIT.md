@@ -278,7 +278,6 @@ Codex/Claude runtime, native permissions, safe mode, or any child reader. Hosted
 Google authorization, per-person custody and resource delivery must be qualified
 by the gateway composition, including negative identity and stale-scope tests.
 
-
 ### Native budget-fix composition
 
 This candidate composes accepted native fix `d486395ec53f4820bc9b9836f44c0c78fdc64292`

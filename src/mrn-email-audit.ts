@@ -641,7 +641,14 @@ export async function executeEmailAuditWithTransport(
     if (signal?.aborted) throw McpErrorFactory.cancelled();
     const remaining = deadline - Date.now();
     if (remaining < 1000) refuse('EMAIL_AUDIT_BATCH_BUDGET');
-    return transport.call(ability, input, internal, Math.min(timeout, remaining), timeout, deadline);
+    return transport.call(
+      ability,
+      input,
+      internal,
+      Math.min(timeout, remaining),
+      timeout,
+      deadline
+    );
   };
   const inventory = async (): Promise<Site[]> => {
     const sites: Site[] = [];
