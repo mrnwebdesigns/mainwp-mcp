@@ -271,6 +271,29 @@
           "items": {
             "$ref": "#/$defs/match"
           }
+        },
+        "scan_complete": {
+          "type": "boolean"
+        },
+        "preparation": {
+          "type": "object",
+          "properties": {
+            "sync_started_at": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sync_outcome": {
+              "enum": ["returned", "timeout_or_refused", "interrupted"]
+            },
+            "readback": {
+              "enum": ["pending", "complete"]
+            },
+            "knowledge": {
+              "enum": ["pending", "complete"]
+            }
+          },
+          "required": ["sync_started_at", "readback", "knowledge"],
+          "additionalProperties": false
         }
       },
       "required": ["site_id", "site_url", "status", "pages", "sync", "limitations", "matches"],

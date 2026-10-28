@@ -47,6 +47,8 @@ let directory: string,
   maxActive: number;
 let child: (input: Record<string, unknown>) => Promise<unknown>;
 let sync: (input: Record<string, unknown>) => Promise<unknown>;
+let readback: (input: Record<string, unknown>) => Promise<unknown>;
+let knowledge: () => Promise<unknown>;
 const address = 'maintenance@mrnwebdesigns.com';
 const page = (input: Record<string, unknown>, matches: unknown[] = [], next = '') => ({
   contract: CONTRACT,
@@ -112,6 +114,11 @@ beforeEach(() => {
   );
   fake.catalog.mockResolvedValue(catalog);
   sync = async () => ({ synced: true });
+  readback = async input => {
+    const site = sites.find(s => s.url.replace(/\/$/, '') === input.site_id_or_domain);
+    return { ...site, last_sync: new Date().toISOString() };
+  };
+  knowledge = async () => ({ context: [], items: [] });
   child = async input => page(input, input.site_id === 1 ? [match()] : []);
   fake.call.mockImplementation(
     async (_c: unknown, name: string, input: Record<string, unknown>) => {
@@ -134,10 +141,9 @@ beforeEach(() => {
       }
       if (name === 'mainwp/sync-sites-v1') return sync(input);
       if (name === 'mainwp/get-site-v1') {
-        const site = sites.find(s => s.url.replace(/\/$/, '') === input.site_id_or_domain);
-        return { ...site, last_sync: new Date().toISOString() };
+        return readback(input);
       }
-      if (name === 'mainwp/get-site-knowledge-v1') return { context: [], items: [] };
+      if (name === 'mainwp/get-site-knowledge-v1') return knowledge();
       if (name === 'mrn-mainwp/audit-email-address-v1') {
         active++;
         maxActive = Math.max(active, maxActive);
@@ -230,9 +236,16 @@ describe('native read-only email configuration audit', () => {
     expect(v.pending).toBe(1);
     expect(v.unmatched).toBe(0);
     expect(v.inspected).toBe(0);
+    const deferred = store.load(String(s.audit_id)).rows[0];
+    expect(deferred.preparation?.readback).toBe('pending');
+    expect(deferred.limitations).toEqual([]);
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/get-site-v1')).toHaveLength(0);
     const again = await run(1, { audit_id: s.audit_id, max_duration_ms: 20000 });
     expect(again.matched).toBe(1);
     expect(again.finished).toBe(true);
+    expect(again.incomplete).toBe(0);
+    expect(store.load(String(s.audit_id)).rows[0].sync).toBe('verified');
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(1);
   });
   it('rejects credential-shaped evidence paths rather than returning them as ordinary matches', async () => {
     child = async input => page(input, [match(1, { setting_path: 'options.smtp.password' })]);
@@ -339,7 +352,7 @@ describe('native read-only email configuration audit', () => {
     expect(store.load(String(s.audit_id)).rows[0].matches).toHaveLength(1);
     expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(1);
   });
-  it('keeps independent settings inspection after a targeted sync timeout, and marks the gap', async () => {
+  it('reconciles an uncertain sync through a fresh exact-site readback without replaying it', async () => {
     sync = async input => {
       expect(input.site_ids_or_domains).toEqual([1]);
       throw new Error('timeout');
@@ -347,9 +360,93 @@ describe('native read-only email configuration audit', () => {
     const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
     const v = await run(1, { audit_id: s.audit_id });
     expect(v.matched).toBe(1);
+    expect(v.incomplete).toBe(0);
+    expect(v.failed).toBe(0);
+    const row = store.load(String(s.audit_id)).rows[0];
+    expect(row.sync).toBe('verified');
+    expect(row.preparation?.sync_outcome).toBe('timeout_or_refused');
+    expect(row.limitations).toEqual([]);
+  });
+  it('retains the real freshness gap while inspecting child settings independently', async () => {
+    sync = async () => {
+      throw new Error('timeout');
+    };
+    readback = async () => ({ ...sites[0], last_sync: '2020-01-01T00:00:00Z' });
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const v = await run(1, { audit_id: s.audit_id });
+    expect(v.matched).toBe(1);
     expect(v.incomplete).toBe(1);
     expect(v.failed).toBe(0);
-    expect(store.load(String(s.audit_id)).rows[0].limitations).toContain('inventory_sync_failed');
+    expect(store.load(String(s.audit_id)).rows[0].limitations).toEqual([
+      'inventory_sync_unverified',
+      'inventory_freshness_unverified',
+    ]);
+  });
+  it('refreshes only named completed metadata after late sync completion, retaining real coverage gaps', async () => {
+    sync = async () => {
+      throw new Error('timeout');
+    };
+    readback = async () => ({ ...sites[0], last_sync: '2020-01-01T00:00:00Z' });
+    knowledge = async () => {
+      throw new Error('timeout');
+    };
+    child = async input => ({
+      ...page(input, [match()]),
+      limitations: ['unresolved_dynamic_reference'],
+    });
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    await run(1, { audit_id: s.audit_id });
+    const before = store.load(String(s.audit_id)).rows[0];
+    readback = async () => ({ ...sites[0], last_sync: new Date().toISOString() });
+    knowledge = async () => ({});
+    const callsBefore = fake.call.mock.calls.length;
+    const v = await run(1, { audit_id: s.audit_id, refresh_site_ids: [1] });
+    const row = store.load(String(s.audit_id)).rows[0];
+    expect(v.finished).toBe(true);
+    expect(row.sync).toBe('verified');
+    expect(row.limitations).toEqual(['unresolved_dynamic_reference']);
+    expect(row.matches).toEqual(before.matches);
+    expect(row.pages).toBe(before.pages);
+    expect(fake.call.mock.calls.slice(callsBefore).map(c => c[1])).not.toContain(
+      'mainwp/sync-sites-v1'
+    );
+    expect(fake.call.mock.calls.slice(callsBefore).map(c => c[1])).not.toContain(
+      'mrn-mainwp/audit-email-address-v1'
+    );
+    await expect(run(1, { audit_id: s.audit_id, refresh_site_ids: [2] })).rejects.toThrow(
+      'EMAIL_AUDIT_REFRESH_SCOPE'
+    );
+    await expect(run(1, { audit_id: s.audit_id, refresh_site_ids: [1, 1] })).rejects.toThrow();
+  });
+  it('defers sync after a Knowledge read exhausts the batch, without inventing failed calls', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    knowledge = async () => {
+      now += 21000;
+      return {};
+    };
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const v = await run(1, { audit_id: s.audit_id });
+    expect(v.pending).toBe(1);
+    expect(store.load(String(s.audit_id)).rows[0].sync).toBe('not_attempted');
+    expect(store.load(String(s.audit_id)).rows[0].limitations).toEqual([]);
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(0);
+    await run(1, { audit_id: s.audit_id });
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/get-site-knowledge-v1')).toHaveLength(
+      1
+    );
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(1);
+  });
+  it('reconciles an interrupted dispatch and old progress without repeating the sync', async () => {
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const saved = store.load(String(s.audit_id));
+    saved.rows[0].sync = 'dispatched';
+    saved.rows[0].limitations = ['inventory_sync_failed', 'site_knowledge_unavailable'];
+    store.save(saved);
+    const v = await run(1, { audit_id: s.audit_id });
+    expect(v.incomplete).toBe(0);
+    expect(store.load(String(s.audit_id)).rows[0].sync).toBe('verified');
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(0);
   });
   it('bounds concurrency and keeps failed sites from aborting successful independent sites', async () => {
     child = async input => {
@@ -384,6 +481,7 @@ describe('native read-only email configuration audit', () => {
     const v = await run(1, { audit_id: s.audit_id, retry_site_ids: [2] });
     expect(v.matched).toBe(1);
     expect(v.failed).toBe(2);
+    expect(store.load(String(s.audit_id)).rows.find(r => r.site_id === 2)?.limitations).toEqual([]);
   });
   it('marks unsupported storage incomplete and separates current from disabled/inherited references', async () => {
     child = async input => ({

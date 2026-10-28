@@ -57,7 +57,14 @@ type Row = Site & {
   status: 'pending' | 'inspecting' | 'complete' | 'failed';
   cursor: string;
   pages: number;
+  scan_complete?: boolean;
   sync: string;
+  preparation?: {
+    sync_started_at: number;
+    sync_outcome?: 'returned' | 'timeout_or_refused' | 'interrupted';
+    readback: 'pending' | 'complete';
+    knowledge: 'pending' | 'complete';
+  };
   limitations: string[];
   matches: Match[];
   error_code?: string;
@@ -104,6 +111,12 @@ const schemas: Tool['inputSchema'][] = [
       concurrency: { type: 'integer', minimum: 1, maximum: 2, default: 1 },
       max_duration_ms: { type: 'integer', minimum: 1000, maximum: 120000, default: 20000 },
       retry_site_ids: {
+        type: 'array',
+        maxItems: 200,
+        uniqueItems: true,
+        items: { type: 'integer', minimum: 1 },
+      },
+      refresh_site_ids: {
         type: 'array',
         maxItems: 200,
         uniqueItems: true,
@@ -474,6 +487,14 @@ export async function executeEmailAudit(
       new Set(args.retry_site_ids).size !== args.retry_site_ids.length)
   )
     refuse('EMAIL_AUDIT_RETRY_SCOPE');
+  if (
+    args.refresh_site_ids !== undefined &&
+    (!Array.isArray(args.refresh_site_ids) ||
+      args.refresh_site_ids.length > 200 ||
+      new Set(args.refresh_site_ids).size !== args.refresh_site_ids.length ||
+      args.refresh_site_ids.some(v => !Number.isSafeInteger(v) || Number(v) < 1))
+  )
+    refuse('EMAIL_AUDIT_REFRESH_SCOPE');
   if (index === 3 && !['json', 'csv'].includes(String(args.format))) refuse('EMAIL_AUDIT_FORMAT');
   if (
     config.dashboardUrl.replace(/\/$/, '') !== 'https://wpcontrol.mrndev.io' ||
@@ -497,7 +518,8 @@ export async function executeEmailAudit(
   const call = async (
     abilityName: string,
     input: ObjectValue,
-    internal = false
+    internal = false,
+    timeout = 30_000
   ): Promise<unknown> => {
     const tool = abilityName.startsWith(PREFIX)
       ? 'mrn_mainwp__' + abilityName.slice(PREFIX.length).replaceAll('-', '_')
@@ -522,7 +544,7 @@ export async function executeEmailAudit(
       {
         ...config,
         retryEnabled: false,
-        requestTimeout: Math.min(config.requestTimeout, 30_000, remaining),
+        requestTimeout: Math.min(config.requestTimeout, timeout, remaining),
       },
       abilityName,
       input,
@@ -661,6 +683,19 @@ export async function executeEmailAudit(
     if ((await authorize(job.rows)) !== job.actor_id)
       throw McpErrorFactory.permissionDenied('EMAIL_AUDIT_ACTOR_CHANGED');
     if (index === 1) {
+      for (const sid of (args.refresh_site_ids ?? []) as number[]) {
+        const row = job.rows.find(r => r.site_id === sid);
+        if (!row || row.status !== 'complete' || row.sync === 'not_attempted')
+          refuse('EMAIL_AUDIT_REFRESH_SCOPE');
+        row.status = 'pending';
+        row.scan_complete = true;
+        row.preparation = {
+          sync_started_at: row.preparation?.sync_started_at ?? Date.parse(job.created_at),
+          sync_outcome: row.preparation?.sync_outcome ?? 'interrupted',
+          readback: 'pending',
+          knowledge: 'pending',
+        };
+      }
       const retry = args.retry_site_ids ?? [];
       for (const sid of retry as number[]) {
         const row = job.rows.find(r => r.site_id === sid);
@@ -680,24 +715,62 @@ export async function executeEmailAudit(
           row.status = 'inspecting';
           store.save(job);
           try {
-            if (row.sync === 'not_attempted') {
-              row.sync = 'dispatched';
-              store.save(job);
-              const start = Date.now();
+            // Persist independent preparation stages. Exhausting a batch is not
+            // evidence that a read failed, nor permission to replay a sync that
+            // the Dashboard may still be processing.
+            row.preparation ??= {
+              sync_started_at: Date.parse(job.created_at),
+              ...(row.sync === 'not_attempted' ? {} : { sync_outcome: 'interrupted' }),
+              readback: 'pending',
+              knowledge: 'pending',
+            };
+            const preparation = row.preparation;
+            const budgetError = (error: unknown) =>
+              signal?.aborted ||
+              (error instanceof Error && error.message.includes('EMAIL_AUDIT_BATCH_BUDGET'));
+            if (preparation.knowledge === 'pending') {
               try {
-                await call('mainwp/sync-sites-v1', { site_ids_or_domains: [row.site_id] });
-                row.sync = 'returned';
-              } catch {
-                row.sync = 'timeout_or_refused';
-                row.limitations.push('inventory_sync_failed');
+                await call('mainwp/get-site-knowledge-v1', { site_id: row.site_id });
+                row.limitations = row.limitations.filter(v => v !== 'site_knowledge_unavailable');
+              } catch (error) {
+                if (budgetError(error)) throw error;
+                row.limitations.push('site_knowledge_unavailable');
               }
+              preparation.knowledge = 'complete';
+              store.save(job);
+            }
+            if (row.sync === 'not_attempted') {
+              if (deadline - Date.now() < 1000) refuse('EMAIL_AUDIT_BATCH_BUDGET');
+              row.sync = 'dispatched';
+              preparation.sync_started_at = Date.now();
+              store.save(job);
+              try {
+                await call(
+                  'mainwp/sync-sites-v1',
+                  { site_ids_or_domains: [row.site_id] },
+                  false,
+                  15000
+                );
+                row.sync = 'returned';
+                preparation.sync_outcome = 'returned';
+              } catch (error) {
+                row.sync = 'timeout_or_refused';
+                preparation.sync_outcome = 'timeout_or_refused';
+                row.limitations.push('inventory_sync_unverified');
+                store.save(job);
+                if (budgetError(error)) throw error;
+              }
+              store.save(job);
+            }
+            if (preparation.readback === 'pending') {
               let siteValue: unknown;
               try {
                 siteValue = await call('mainwp/get-site-v1', {
                   site_id_or_domain: row.site_url,
                   include_stats: false,
                 });
-              } catch {
+              } catch (error) {
+                if (budgetError(error)) throw error;
                 row.limitations.push('inventory_readback_failed');
               }
               if (siteValue !== undefined) {
@@ -709,17 +782,27 @@ export async function executeEmailAudit(
                   refuse('EMAIL_AUDIT_SITE_IDENTITY');
                 if (
                   typeof siteValue.last_sync === 'string' &&
-                  Date.parse(siteValue.last_sync) >= start - 1000
-                )
+                  Date.parse(siteValue.last_sync) >= preparation.sync_started_at - 1000
+                ) {
                   row.sync = 'verified';
-                else row.limitations.push('inventory_freshness_unverified');
+                  row.limitations = row.limitations.filter(
+                    v =>
+                      ![
+                        'inventory_sync_failed',
+                        'inventory_sync_unverified',
+                        'inventory_readback_failed',
+                        'inventory_freshness_unverified',
+                      ].includes(v)
+                  );
+                } else row.limitations.push('inventory_freshness_unverified');
               }
-              try {
-                await call('mainwp/get-site-knowledge-v1', { site_id: row.site_id });
-              } catch {
-                row.limitations.push('site_knowledge_unavailable');
-              }
+              preparation.readback = 'complete';
               store.save(job);
+            }
+            if (row.scan_complete) {
+              row.status = 'complete';
+              store.save(job);
+              continue;
             }
             for (let page = 0; page < Number(args.max_pages_per_site ?? 2); page++) {
               const v = cleanPage(
@@ -769,6 +852,12 @@ export async function executeEmailAudit(
               row.limitations = [...new Set([...row.limitations, ...v.limitations])];
               row.inspected_at = new Date().toISOString();
               row.status = v.done ? 'complete' : 'pending';
+              if (v.done) {
+                row.limitations = row.limitations.filter(
+                  v => v !== 'settings_inspection_incomplete'
+                );
+                delete row.error_code;
+              }
               store.save(job);
               if (v.done) break;
             }
@@ -819,7 +908,9 @@ export async function executeEmailAudit(
             site_url,
             status,
             pages,
+            scan_complete,
             sync,
+            preparation,
             limitations,
             error_code,
             inspected_at,
@@ -830,7 +921,9 @@ export async function executeEmailAudit(
             site_url,
             status,
             pages,
+            scan_complete,
             sync,
+            preparation,
             limitations,
             error_code,
             inspected_at,

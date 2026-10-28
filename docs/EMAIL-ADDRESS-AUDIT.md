@@ -38,12 +38,12 @@ evidence, not instructions for the caller.
 
 Add only these exact names to the existing allowlist after release approval:
 
-| Tool                                          | Required arguments   | Optional arguments / bounds                                                                                                                                                                      |
-| --------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `mrn_mainwp__start_email_address_audit_v1`    | `address`, `scope`   | `scope` is `site`, `sites`, or explicitly `fleet`; `site_urls` is required for `site`/`sites` (1 / 1–200 exact URLs) and forbidden for `fleet`                                                   |
-| `mrn_mainwp__continue_email_address_audit_v1` | `audit_id`           | `max_sites`: 1–10 (default 2); `max_pages_per_site`: 1–8 (default 2); `concurrency`: 1–2 (default 1); `max_duration_ms`: 1000–120000 (default 20000); `retry_site_ids`: explicit failed IDs only |
-| `mrn_mainwp__get_email_address_audit_v1`      | `audit_id`           | Site `offset` / `limit` (default 0 / 10, maximum 20); per-site `match_offset` / `match_limit` (default 0 / 50, maximum 100)                                                                      |
-| `mrn_mainwp__export_email_address_audit_v1`   | `audit_id`, `format` | `format`: `json` or `csv`; destination paths are fixed and are never caller arguments                                                                                                            |
+| Tool                                          | Required arguments   | Optional arguments / bounds                                                                                                                                                                                                                                                                    |
+| --------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mrn_mainwp__start_email_address_audit_v1`    | `address`, `scope`   | `scope` is `site`, `sites`, or explicitly `fleet`; `site_urls` is required for `site`/`sites` (1 / 1–200 exact URLs) and forbidden for `fleet`                                                                                                                                                 |
+| `mrn_mainwp__continue_email_address_audit_v1` | `audit_id`           | `max_sites`: 1–10 (default 2); `max_pages_per_site`: 1–8 (default 2); `concurrency`: 1–2 (default 1); `max_duration_ms`: 1000–120000 (default 20000); `retry_site_ids`: explicit failed IDs only; `refresh_site_ids`: explicit completed IDs whose sync readback/Knowledge should be rechecked |
+| `mrn_mainwp__get_email_address_audit_v1`      | `audit_id`           | Site `offset` / `limit` (default 0 / 10, maximum 20); per-site `match_offset` / `match_limit` (default 0 / 50, maximum 100)                                                                                                                                                                    |
+| `mrn_mainwp__export_email_address_audit_v1`   | `audit_id`, `format` | `format`: `json` or `csv`; destination paths are fixed and are never caller arguments                                                                                                                                                                                                          |
 
 Native private providers are `mrn-mainwp/audit-email-address-v1` and
 `mrn-mainwp/authorize-email-address-audit-v1`. The orchestrator verifies their
@@ -195,9 +195,39 @@ forms are separate evidence. These exclusions deliberately limit “every use.�
 ## Reliability and local data
 
 Every selected site receives one narrowly scoped sync attempt. A timeout is
-followed by site/timestamp readback and recorded as a coverage gap; native child
+followed by site/timestamp readback; native child
 plugin discovery and settings inspection can proceed independently. Sync is not
 blindly retried: the Dashboard may still be working after a caller timeout.
+Knowledge, sync dispatch and readback have independent durable checkpoints.
+When the batch budget expires, unattempted reads remain pending rather than
+becoming fictional failures. Sync is capped at 15 seconds within the existing
+batch budget, leaving room for readback when possible. A fresh exact-site
+`last_sync` proves freshness even if the original caller timed out; its uncertain
+dispatch outcome remains recorded in `preparation.sync_outcome`.
+
+For a completed scan whose original sync finished later, recheck only its metadata:
+
+```json
+{ "audit_id": "<returned UUID>", "refresh_site_ids": [7] }
+```
+
+This re-reads exact-site status and current Knowledge without replaying sync,
+re-reading settings, or changing captured matches/timestamps. Only proved-resolved
+metadata flags clear; unsupported form/storage/routing limitations remain. Site
+ACLs and actor identity are checked first as on every other call. The optional
+`scan_complete` and `preparation` fields document these checkpoints. A successful
+explicit settings retry similarly clears only the prior interrupted-inspection
+flag, preserving actual coverage gaps. Use a fresh job when current settings
+evidence, rather than a metadata reconciliation, is required.
+
+Child reader 0.3.5 recognizes legacy WPForms recipient/sender/reply-to fields,
+keeps shadowed legacy recipients historical, and reports malformed schemas with
+an exact form ID and failure kind, never full values. Empty draft/trash records
+are distinct from malformed live forms. Ordinary message placeholders do not
+constitute unresolved address routing. A known admin token resolving to another
+address is nonmatching, while additional unknown address tokens remain explicit
+gaps even alongside a direct match. The authenticated agent status provides an
+own-package tree digest/file count for comparison to the reviewed archive.
 
 Each returned page is atomically saved before advancing. Child pagination is
 MAC-bound to exact site/address and plugin inventory, expires after 24 hours,
