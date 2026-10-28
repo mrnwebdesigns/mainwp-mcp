@@ -1,5 +1,6 @@
 /** Synthetic Dashboard/child fixtures only; never contacts or mutates client sites. */
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -437,6 +438,164 @@ describe('native read-only email configuration audit', () => {
     );
     expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(1);
   });
+  it('resumes a page clipped by the batch deadline without losing its cursor or replaying sync', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    knowledge = async () => {
+      now += 3000;
+      return {};
+    };
+    sync = async () => {
+      now += 4000;
+      return {};
+    };
+    readback = async () => {
+      now += 3000;
+      return { ...sites[0], last_sync: new Date(now).toISOString() };
+    };
+    let expired = false;
+    child = async input => {
+      if (!input.cursor) {
+        now += 3000;
+        return page(input, [match()], 'saved-next-page');
+      }
+      if (!expired) {
+        expired = true;
+        const effective = (fake.call.mock.calls.at(-1)?.[0] as typeof config).requestTimeout;
+        expect(effective).toBe(2000);
+        now += effective;
+        throw Object.assign(new Error('Request timeout'), { code: 'ETIMEDOUT' });
+      }
+      return page(input);
+    };
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    let v = await run(1, { audit_id: s.audit_id, max_duration_ms: 15000 });
+    expect(v.failed).toBe(0);
+    expect(v.pending).toBe(1);
+    let row = store.load(String(s.audit_id)).rows[0];
+    expect(row.cursor).toBe('saved-next-page');
+    expect(row.pages).toBe(1);
+    expect(row.matches).toHaveLength(1);
+    expect(row.error_code).toBeUndefined();
+    v = await run(1, { audit_id: s.audit_id, max_duration_ms: 15000 });
+    row = store.load(String(s.audit_id)).rows[0];
+    expect(v.finished).toBe(true);
+    expect(v.failed).toBe(0);
+    expect(row.pages).toBe(2);
+    expect(row.matches).toHaveLength(1);
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(1);
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/get-site-knowledge-v1')).toHaveLength(
+      1
+    );
+  });
+  it('keeps budget-expired Knowledge pending instead of inventing a permanent coverage gap', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let expired = false;
+    knowledge = async () => {
+      if (!expired) {
+        expired = true;
+        now += (fake.call.mock.calls.at(-1)?.[0] as typeof config).requestTimeout;
+        throw Object.assign(new Error('Request timeout'), { code: 'ETIMEDOUT' });
+      }
+      return {};
+    };
+    readback = async () => ({ ...sites[0], last_sync: new Date(now).toISOString() });
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const first = await run(1, { audit_id: s.audit_id, max_duration_ms: 2000 });
+    expect(first.pending).toBe(1);
+    expect(first.failed).toBe(0);
+    expect(store.load(String(s.audit_id)).rows[0].preparation?.knowledge).toBe('pending');
+    expect(store.load(String(s.audit_id)).rows[0].limitations).toEqual([]);
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(0);
+    const next = await run(1, { audit_id: s.audit_id, max_duration_ms: 2000 });
+    expect(next.finished).toBe(true);
+    expect(next.incomplete).toBe(0);
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/get-site-knowledge-v1')).toHaveLength(
+      2
+    );
+    expect(fake.call.mock.calls.filter(c => c[1] === 'mainwp/sync-sites-v1')).toHaveLength(1);
+  });
+  it('retains genuine full-request timeouts and requires an explicit retry', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let reads = 0;
+    child = async () => {
+      reads++;
+      now += config.requestTimeout;
+      throw Object.assign(new Error('Request timeout'), { code: 'ETIMEDOUT' });
+    };
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const failed = await run(1, { audit_id: s.audit_id, max_duration_ms: 20000 });
+    expect(failed.failed).toBe(1);
+    expect(store.load(String(s.audit_id)).rows[0].error_code).toBe('EMAIL_AUDIT_TIMEOUT');
+    await run(1, { audit_id: s.audit_id, max_duration_ms: 20000 });
+    expect(reads).toBe(1);
+  });
+  it('does not turn a permission refusal at the batch deadline into resumable work', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    child = async () => {
+      now += (fake.call.mock.calls.at(-1)?.[0] as typeof config).requestTimeout;
+      throw Object.assign(new Error('Permission refused'), { code: 'HTTP_FORBIDDEN', status: 403 });
+    };
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const v = await run(1, { audit_id: s.audit_id, max_duration_ms: 2000 });
+    expect(v.failed).toBe(1);
+    expect(v.pending).toBe(0);
+    expect(v.matched).toBe(0);
+    expect(store.load(String(s.audit_id)).rows[0].error_code).toBe('EMAIL_AUDIT_PERMISSION');
+  });
+  it('retains an early transport timeout even when the request budget was clipped', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    child = async () => {
+      now += 1000;
+      throw Object.assign(new Error('Request timeout'), { code: 'ETIMEDOUT' });
+    };
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const v = await run(1, { audit_id: s.audit_id, max_duration_ms: 2000 });
+    expect(v.failed).toBe(1);
+    expect(store.load(String(s.audit_id)).rows[0].error_code).toBe('EMAIL_AUDIT_TIMEOUT');
+  });
+  it('retains unknown upstream errors at the batch deadline', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    child = async () => {
+      now += (fake.call.mock.calls.at(-1)?.[0] as typeof config).requestTimeout;
+      throw Object.assign(new Error('Unknown upstream failure'), {
+        code: 'HTTP_ERROR',
+        status: 500,
+      });
+    };
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const v = await run(1, { audit_id: s.audit_id, max_duration_ms: 2000 });
+    expect(v.failed).toBe(1);
+    expect(v.pending).toBe(0);
+    expect(store.load(String(s.audit_id)).rows[0].error_code).toBe('EMAIL_AUDIT_INSPECTION_FAILED');
+  });
+  it('does not defer an authorization timeout or release stored evidence without authorization', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
+    const delegate = fake.call.getMockImplementation()!;
+    fake.call.mockImplementation(
+      async (c: typeof config, name: string, input: Record<string, unknown>) => {
+        if (name === 'mrn-mainwp/authorize-email-address-audit-v1') {
+          now += c.requestTimeout;
+          throw Object.assign(new Error('Request timeout'), { code: 'ETIMEDOUT' });
+        }
+        return delegate(c, name, input);
+      }
+    );
+    await expect(run(1, { audit_id: s.audit_id, max_duration_ms: 2000 })).rejects.toThrow(
+      'Request timeout'
+    );
+    expect(store.load(String(s.audit_id)).rows[0].pages).toBe(0);
+    expect(
+      fake.call.mock.calls.filter(c => c[1] === 'mrn-mainwp/audit-email-address-v1')
+    ).toHaveLength(0);
+  });
   it('reconciles an interrupted dispatch and old progress without repeating the sync', async () => {
     const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
     const saved = store.load(String(s.audit_id));
@@ -534,21 +693,23 @@ describe('native read-only email configuration audit', () => {
     expect(v.unmatched).toBe(0);
   });
   it('exports only minimal evidence, protects files and writes formula-safe CSV with coverage sidecar', async () => {
+    // Generated synthetic exclusion value; no stored credential fixture.
+    const excludedValue = `synthetic-excluded-${randomUUID()}`;
     child = async input => ({
       ...page(input, [
         match(1, {
           form_title: '=1+2',
-          password: 'sensitive-secret',
-          full_option: 'sensitive-secret',
+          password: excludedValue,
+          full_option: excludedValue,
         }),
       ]),
-      password: 'sensitive-secret',
+      password: excludedValue,
     });
     const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
     await run(1, { audit_id: s.audit_id });
     const v = await run(3, { audit_id: s.audit_id, format: 'json' });
     const data = fs.readFileSync(String(v.file), 'utf8');
-    expect(data).not.toContain('sensitive-secret');
+    expect(data).not.toContain(excludedValue);
     expect(data).not.toContain('identity');
     expect(fs.statSync(String(v.file)).mode & 0o777).toBe(0o600);
     const csv = await run(3, { audit_id: s.audit_id, format: 'csv' });

@@ -470,7 +470,8 @@ export async function executeEmailAudit(
     abilityName: string,
     input: ObjectValue,
     internal = false,
-    timeout = 30_000
+    timeout = 30_000,
+    perCallLimit = timeout
   ): Promise<unknown> => {
     const tool = abilityName.startsWith(PREFIX)
       ? 'mrn_mainwp__' + abilityName.slice(PREFIX.length).replaceAll('-', '_')
@@ -488,19 +489,45 @@ export async function executeEmailAudit(
     )
       refuse('EMAIL_AUDIT_SUPPORTING_ABILITY_UNQUALIFIED');
     if (signal?.aborted) throw McpErrorFactory.cancelled();
+    const remaining = deadlineAt - Date.now();
+    if (remaining < 1000) refuse('EMAIL_AUDIT_BATCH_BUDGET');
+    const requestLimit = Math.min(config.requestTimeout, perCallLimit);
+    const requestTimeout = Math.min(requestLimit, timeout, remaining);
     // This read-only workflow never needs longer timeouts or automatic HTTP retries.
-    return executeAbility(
-      {
-        ...config,
-        retryEnabled: false,
-        requestTimeout: Math.min(config.requestTimeout, timeout),
-      },
-      abilityName,
-      input,
-      logger,
-      ability as Ability,
-      signal
-    );
+    try {
+      return await executeAbility(
+        { ...config, retryEnabled: false, requestTimeout },
+        abilityName,
+        input,
+        logger,
+        ability as Ability,
+        signal
+      );
+    } catch (error) {
+      // Only worker calls may defer after a shortened local deadline. Scope and
+      // authorization checks remain fail-closed; a full request timeout, early
+      // transport error or upstream refusal remains a genuine failure.
+      const workerCall = [
+        INSPECT,
+        'mainwp/get-site-knowledge-v1',
+        'mainwp/get-site-v1',
+        'mainwp/sync-sites-v1',
+      ].includes(abilityName);
+      if (
+        index === 1 &&
+        workerCall &&
+        requestTimeout < requestLimit &&
+        Date.now() >= deadlineAt &&
+        !signal?.aborted &&
+        error !== null &&
+        typeof error === 'object' &&
+        'code' in error &&
+        error.code === 'ETIMEDOUT' &&
+        ![401, 403].includes(getHttpStatus(error) ?? 0)
+      )
+        refuse('EMAIL_AUDIT_BATCH_BUDGET');
+      throw error;
+    }
   };
   return executeEmailAuditWithTransport(
     { identity: configIdentityHash(config), call, deadlineAt },
@@ -522,7 +549,10 @@ export type EmailAuditTransport = {
     ability: string,
     input: ObjectValue,
     internal: boolean,
-    timeout: number
+    timeout: number,
+    // Independent per-call cap before the continuation budget clips timeout.
+    // Only the native adapter uses this to prove its own local ETIMEDOUT.
+    perCallLimit: number
   ) => Promise<unknown>;
   fatal?: (error: unknown) => boolean;
 };
@@ -609,7 +639,7 @@ export async function executeEmailAuditWithTransport(
     if (signal?.aborted) throw McpErrorFactory.cancelled();
     const remaining = deadline - Date.now();
     if (remaining < 1000) refuse('EMAIL_AUDIT_BATCH_BUDGET');
-    return transport.call(ability, input, internal, Math.min(timeout, remaining));
+    return transport.call(ability, input, internal, Math.min(timeout, remaining), timeout);
   };
   const inventory = async (): Promise<Site[]> => {
     const sites: Site[] = [];

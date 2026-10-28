@@ -82,6 +82,13 @@ being inspected. Unsupported/invalid Dashboard inventory itself is a scope error
 
 Continue the returned job until `finished: true`, respecting `pending`:
 
+A worker request shortened by the remaining continuation budget stays `pending`
+when that local deadline expires. Its saved cursor, matches and preparation
+stages survive; a dispatched sync is not repeated. This does not extend any
+request limit or enable HTTP retries. Full request timeouts, earlier transport
+failures, upstream refusals and authorization failures remain failures. Retrying
+a failed site still requires explicit `retry_site_ids`.
+
 ```json
 {
   "audit_id": "<returned UUID>",
@@ -270,3 +277,21 @@ This entry point is source integration only. It does not change the configured
 Codex/Claude runtime, native permissions, safe mode, or any child reader. Hosted
 Google authorization, per-person custody and resource delivery must be qualified
 by the gateway composition, including negative identity and stale-scope tests.
+
+
+### Native budget-fix composition
+
+This candidate composes accepted native fix `d486395ec53f4820bc9b9836f44c0c78fdc64292`
+(merged as `cece5a519c3125b36e8bb1c82b2a1ab46c883738`). The injected call receives
+its original per-call cap as a fifth argument, separately from the already
+clipped timeout. The native adapter alone compares that cap with its configured
+request limit and recognizes its structured `ETIMEDOUT` at the continuation
+deadline. Inventory and authorization stay outside worker deferral. All seven
+accepted regressions are retained unchanged; limits and retries do not change.
+
+The generic injected engine does not interpret SDK `-32001`, an injected
+`ETIMEDOUT`, gateway `OpsError`, or message text as native timeout proof. The
+hosted gateway separately verifies that such errors remain failed/fatal, preserve
+previous pages, and cannot trigger automatic retry or release revoked evidence.
+A hosted local-deadline adapter remains a separate unqualified implementation;
+this composition does not claim the hosted timeout behavior is fixed.
