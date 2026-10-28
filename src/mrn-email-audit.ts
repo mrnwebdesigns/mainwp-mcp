@@ -551,8 +551,10 @@ export type EmailAuditTransport = {
     internal: boolean,
     timeout: number,
     // Independent per-call cap before the continuation budget clips timeout.
-    // Only the native adapter uses this to prove its own local ETIMEDOUT.
-    perCallLimit: number
+    // Adapters must independently prove their own local cancellation.
+    perCallLimit: number,
+    // Absolute engine deadline; a hosted challenge must share this budget.
+    deadlineAt: number
   ) => Promise<unknown>;
   fatal?: (error: unknown) => boolean;
 };
@@ -639,7 +641,7 @@ export async function executeEmailAuditWithTransport(
     if (signal?.aborted) throw McpErrorFactory.cancelled();
     const remaining = deadline - Date.now();
     if (remaining < 1000) refuse('EMAIL_AUDIT_BATCH_BUDGET');
-    return transport.call(ability, input, internal, Math.min(timeout, remaining), timeout);
+    return transport.call(ability, input, internal, Math.min(timeout, remaining), timeout, deadline);
   };
   const inventory = async (): Promise<Site[]> => {
     const sites: Site[] = [];

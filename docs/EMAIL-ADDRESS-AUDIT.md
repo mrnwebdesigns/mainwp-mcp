@@ -283,8 +283,8 @@ by the gateway composition, including negative identity and stale-scope tests.
 
 This candidate composes accepted native fix `d486395ec53f4820bc9b9836f44c0c78fdc64292`
 (merged as `cece5a519c3125b36e8bb1c82b2a1ab46c883738`). The injected call receives
-its original per-call cap as a fifth argument, separately from the already
-clipped timeout. The native adapter alone compares that cap with its configured
+its original per-call cap as a fifth argument and absolute engine deadline as
+a sixth argument, separately from the already clipped timeout. The native adapter alone compares that cap with its configured
 request limit and recognizes its structured `ETIMEDOUT` at the continuation
 deadline. Inventory and authorization stay outside worker deferral. All seven
 accepted regressions are retained unchanged; limits and retries do not change.
@@ -293,5 +293,8 @@ The generic injected engine does not interpret SDK `-32001`, an injected
 `ETIMEDOUT`, gateway `OpsError`, or message text as native timeout proof. The
 hosted gateway separately verifies that such errors remain failed/fatal, preserve
 previous pages, and cannot trigger automatic retry or release revoked evidence.
-A hosted local-deadline adapter remains a separate unqualified implementation;
-this composition does not claim the hosted timeout behavior is fixed.
+The gateway adapter separately qualifies its private request timer and exact
+abort-reason object through the real SDK. It must span the delegation challenge
+and read, await cancellation settlement, preserve fatal access errors and reject
+late success. This engine passes budget metadata; it does not authenticate a
+caller-provided timeout code or claim hosted deployment/ChatGPT acceptance.
