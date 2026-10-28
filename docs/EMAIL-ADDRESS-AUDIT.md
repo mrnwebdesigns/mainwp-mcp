@@ -82,6 +82,13 @@ being inspected. Unsupported/invalid Dashboard inventory itself is a scope error
 
 Continue the returned job until `finished: true`, respecting `pending`:
 
+A worker request shortened by the remaining continuation budget stays `pending`
+when that local deadline expires. Its saved cursor, matches and preparation
+stages survive; a dispatched sync is not repeated. This does not extend any
+request limit or enable HTTP retries. Full request timeouts, earlier transport
+failures, upstream refusals and authorization failures remain failures. Retrying
+a failed site still requires explicit `retry_site_ids`.
+
 ```json
 {
   "audit_id": "<returned UUID>",
