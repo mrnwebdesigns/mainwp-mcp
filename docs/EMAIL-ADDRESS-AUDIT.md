@@ -253,3 +253,20 @@ inheritance/encoding, disabled/inactive/draft states, object/secret exclusion,
 site/actor/ACL changes, timeouts, bounded concurrency, resume, partial 106-site
 inventory and fresh MCP protocol discovery. Fixture success is not a deployed
 child-site verification. See `EMAIL-ADDRESS-AUDIT-DEPLOYMENT.md` for release gates.
+
+## Hosted Google gateway engine adapter (source candidate)
+
+`executeEmailAuditWithTransport` reuses this module's existing bounded inventory,
+preparation checkpoints, scan, coverage, result and export logic. Its caller must
+supply an authenticated native-ability transport and private owner-bound storage.
+It has no credential input or virtual-tool-to-WordPress-ability mapping. The
+closed engine contract is `mrn-email-audit-engine-v1`. A fatal authorization
+failure stops the reader rather than becoming an ordinary per-site coverage gap.
+The hosted gateway uses serial readers and rechecks current access before releasing
+results. Existing local `executeEmailAudit` keeps its native policy/catalog checks,
+credential identity hash, numeric WordPress actor, deadlines and filesystem store.
+
+This entry point is source integration only. It does not change the configured
+Codex/Claude runtime, native permissions, safe mode, or any child reader. Hosted
+Google authorization, per-person custody and resource delivery must be qualified
+by the gateway composition, including negative identity and stale-scope tests.
