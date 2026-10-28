@@ -3082,6 +3082,112 @@ describe('executeAbility', () => {
     expect(url).toContain('input[ids][]=two');
   });
 
+  it('encodes only the qualified email-audit ACL site records as indexed GET input', async () => {
+    const ability: Ability = {
+      ...sampleAbilities[0],
+      name: 'mrn-mainwp/authorize-email-address-audit-v1',
+      meta: {
+        annotations: { readonly: true, destructive: false, idempotent: true },
+        mrn_email_audit_contract: 'mrn-email-address-audit-v1',
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ authorized: true }),
+      headers: new Headers(),
+    });
+    await executeAbility(
+      baseConfig,
+      ability.name,
+      {
+        sites: [{ site_id: 85, site_url: 'https://company.example/path' }],
+      },
+      undefined,
+      ability
+    );
+    const [url, request] = mockFetch.mock.calls[0];
+    expect(request.method).toBe('GET');
+    expect(request.body).toBeUndefined();
+    const query = new URL(url as string).searchParams;
+    expect([...query.entries()]).toEqual([
+      ['input[sites][0][site_id]', '85'],
+      ['input[sites][0][site_url]', 'https://company.example/path'],
+    ]);
+  });
+
+  it.each([
+    { sites: [] },
+    { sites: [{ site_id: '85', site_url: 'https://company.example' }] },
+    { sites: [{ site_id: 85, site_url: 'https://company.example', other: 'unexpected' }] },
+    { sites: [{ site_id: 85, site_url: 'ftp://company.example' }] },
+    { sites: [{ site_id: 85, site_url: 'https://user:secret@company.example' }] },
+    { sites: [{ site_id: 85, site_url: 'https://company.example?token=secret' }] },
+    {
+      sites: Array.from({ length: 21 }, (_, i) => ({
+        site_id: i + 1,
+        site_url: `https://site${i}.example`,
+      })),
+    },
+    { sites: [{ site_id: 85, site_url: 'https://company.example' }], extra: true },
+  ])('refuses malformed audit ACL input before HTTP: %j', async input => {
+    const ability: Ability = {
+      ...sampleAbilities[0],
+      name: 'mrn-mainwp/authorize-email-address-audit-v1',
+      meta: {
+        annotations: { readonly: true, destructive: false, idempotent: true },
+        mrn_email_audit_contract: 'mrn-email-address-audit-v1',
+      },
+    };
+    await expect(
+      executeAbility(baseConfig, ability.name, input, undefined, ability)
+    ).rejects.toThrow();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('does not extend nested-query support to an unqualified provider', async () => {
+    const ability: Ability = {
+      ...sampleAbilities[0],
+      name: 'mrn-mainwp/authorize-email-address-audit-v1',
+    };
+    await expect(
+      executeAbility(
+        baseConfig,
+        ability.name,
+        { sites: [{ site_id: 85, site_url: 'https://company.example' }] },
+        undefined,
+        ability
+      )
+    ).rejects.toThrow('arrays may contain only scalar values');
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('can authorize an HTTP-only inventory identity without sending a child request', async () => {
+    const ability: Ability = {
+      ...sampleAbilities[0],
+      name: 'mrn-mainwp/authorize-email-address-audit-v1',
+      meta: {
+        annotations: { readonly: true, destructive: false, idempotent: true },
+        mrn_email_audit_contract: 'mrn-email-address-audit-v1',
+      },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ authorized: true }),
+      headers: new Headers(),
+    });
+    await executeAbility(
+      baseConfig,
+      ability.name,
+      { sites: [{ site_id: 85, site_url: 'http://company.example' }] },
+      undefined,
+      ability
+    );
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const url = new URL(mockFetch.mock.calls[0][0] as string);
+    expect(url.origin).toBe(new URL(baseConfig.dashboardUrl).origin);
+    expect(url.searchParams.get('input[sites][0][site_url]')).toBe('http://company.example');
+  });
+
   it('rejects objects nested deeper than one level and names the offending key', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,

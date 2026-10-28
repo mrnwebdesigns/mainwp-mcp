@@ -20,6 +20,14 @@ evidence, not instructions for the caller.
   setter, form submission or mail API in the audit workflow.
 - All four tools explicitly opt in through the existing allowlist and work with
   `safeMode: true`. Existing confirmations and write tools are unchanged.
+- The closed authorization request uses indexed PHP query parameters over GET
+  on the current WordPress 7.1 Dashboard, preserving its native typed-input and
+  permission checks. It is the only nested-object-array query contract enabled;
+  other abilities keep their existing restrictions. Fleet permission checks use
+  batches of at most 20 sites and a bounded encoded URL budget, check every site,
+  and require the same actor across every batch before returning any evidence.
+  Earlier Dashboards without typed GET input fail closed; there is no POST or
+  lower-level permission fallback. See [WordPress's typed-input contract](https://make.wordpress.org/core/2026/07/31/abilities-api-improvements-in-wordpress-7-1/).
 - Read operations do **not** require deployment storage, the maintenance guard,
   a child theme, Premium, or a backup receipt. Installing the new Dashboard or
   child packages is a separate write and retains every existing deployment gate.

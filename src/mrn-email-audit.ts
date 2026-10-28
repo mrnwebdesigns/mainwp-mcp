@@ -563,21 +563,35 @@ export async function executeEmailAudit(
     return refuse('EMAIL_AUDIT_INVENTORY_LIMIT');
   };
   const authorize = async (sites: Site[]): Promise<number> => {
-    const v = await call(
-      AUTHORIZE,
-      { sites: sites.map(s => ({ site_id: s.site_id, site_url: s.site_url })) },
-      true
-    );
-    if (
-      !object(v) ||
-      v.contract !== EMAIL_AUDIT_CONTRACT ||
-      v.authorized !== true ||
-      !Number.isInteger(v.actor_id) ||
-      Number(v.actor_id) < 1 ||
-      v.site_count !== sites.length
-    )
-      throw McpErrorFactory.permissionDenied('EMAIL_AUDIT_ACCESS_CHANGED');
-    return Number(v.actor_id);
+    let actor = 0;
+    for (let offset = 0; offset < sites.length;) {
+      // The native read-only ability requires GET. Keep indexed PHP parameters
+      // below the existing URL limit; never change method or weaken the ACL.
+      const batch: Site[] = [];
+      let encoded = 0;
+      while (offset < sites.length && batch.length < 20) {
+        const site = sites[offset];
+        const cost = encodeURIComponent(site.site_url).length + 160;
+        if (batch.length && encoded + cost > 6000) break;
+        batch.push({ site_id: site.site_id, site_url: site.site_url });
+        encoded += cost;
+        offset++;
+      }
+      const v = await call(AUTHORIZE, { sites: batch }, true);
+      if (
+        !object(v) ||
+        v.contract !== EMAIL_AUDIT_CONTRACT ||
+        v.authorized !== true ||
+        !Number.isInteger(v.actor_id) ||
+        Number(v.actor_id) < 1 ||
+        v.site_count !== batch.length ||
+        (actor !== 0 && actor !== v.actor_id)
+      )
+        throw McpErrorFactory.permissionDenied('EMAIL_AUDIT_ACCESS_CHANGED');
+      actor = Number(v.actor_id);
+    }
+    if (!actor) throw McpErrorFactory.permissionDenied('EMAIL_AUDIT_ACCESS_CHANGED');
+    return actor;
   };
   if (index === 0) {
     if (typeof args.address !== 'string' || !/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(args.address))

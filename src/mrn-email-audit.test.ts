@@ -252,6 +252,63 @@ describe('native read-only email configuration audit', () => {
     expect(v.total).toBe(1);
     expect(v.scope).toBe('site');
   });
+  it('checks every fleet ACL in URL-bounded batches before persisting a job', async () => {
+    sites = Array.from({ length: 106 }, (_, i) => ({
+      id: i + 1,
+      url: `https://site${i}.example/`,
+    }));
+    const result = await start();
+    const batches = fake.call.mock.calls
+      .filter(c => c[1] === 'mrn-mainwp/authorize-email-address-audit-v1')
+      .map(c => (c[2] as { sites: unknown[] }).sites);
+    expect(batches.map(v => v.length)).toEqual([20, 20, 20, 20, 20, 6]);
+    expect(batches.flat()).toEqual(
+      sites.map(s => ({ site_id: s.id, site_url: s.url.replace(/\/$/, '') }))
+    );
+    expect(result.total).toBe(106);
+    expect(store.load(String(result.audit_id)).actor_id).toBe(5);
+  });
+  it.each(['permission', 'actor'])(
+    'refuses a later ACL batch with changed %s and saves no job',
+    async changed => {
+      sites = Array.from({ length: 21 }, (_, i) => ({
+        id: i + 1,
+        url: `https://site${i}.example/`,
+      }));
+      const original = fake.call.getMockImplementation();
+      if (!original) throw new Error('Missing fixture implementation');
+      let count = 0;
+      fake.call.mockImplementation(async (...args: unknown[]) => {
+        if (args[1] === 'mrn-mainwp/authorize-email-address-audit-v1' && ++count === 2) {
+          return {
+            contract: CONTRACT,
+            authorized: changed !== 'permission',
+            actor_id: changed === 'actor' ? 9 : 5,
+            site_count: 1,
+          };
+        }
+        return original(...args);
+      });
+      await expect(start()).rejects.toThrow('EMAIL_AUDIT_ACCESS_CHANGED');
+      expect(fs.readdirSync(directory)).toHaveLength(0);
+    }
+  );
+  it('reduces ACL batches for long exact site URLs instead of exceeding the GET limit', async () => {
+    sites = Array.from({ length: 21 }, (_, i) => ({
+      id: i + 1,
+      url: `https://site${i}.example/${'x'.repeat(475)}`,
+    }));
+    await start();
+    const batches = fake.call.mock.calls
+      .filter(c => c[1] === 'mrn-mainwp/authorize-email-address-audit-v1')
+      .map(c => (c[2] as { sites: Array<{ site_url: string }> }).sites);
+    expect(batches.length).toBeGreaterThan(2);
+    expect(batches.flat()).toHaveLength(21);
+    for (const batch of batches)
+      expect(
+        batch.reduce((sum, v) => sum + encodeURIComponent(v.site_url).length + 160, 0)
+      ).toBeLessThanOrEqual(6000);
+  });
   it('paginates the complete 106-site inventory and records the exact fleet snapshot', async () => {
     sites = Array.from({ length: 106 }, (_, i) => ({
       id: i + 1,

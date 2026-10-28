@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] - MRN integration
 
+### Fixed
+
+Native email-audit authorization now sends its exact site records as bounded,
+indexed GET parameters. The previous generic serializer rejected object arrays
+before the permission check reached WordPress. All other nested-query restrictions
+remain unchanged. Fleet authorization checks every batch and refuses a changed
+actor or any denied site before creating, resuming or exporting a job.
+
 ### Added
 
 Guarded MRN plugin/theme maintenance with exact-version previews, verified
