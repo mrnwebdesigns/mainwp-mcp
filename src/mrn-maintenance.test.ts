@@ -496,6 +496,62 @@ describe('MRN maintenance through the public executor', () => {
     expect(writes()).toHaveLength(0);
   });
   it.each([
+    'update_not_offered',
+    'update_ignored_site',
+    'update_ignored_global',
+    'update_ignored_site_flag',
+    'preview_permission_denied',
+    'preview_input_invalid',
+    'preview_output_invalid',
+    'preview_native_error',
+    'preview_site_failed',
+    'preview_scope',
+    'preview_site_identity',
+    'preview_schema',
+    'preview_selection',
+  ])(
+    'preserves closed native preview refusal %s without exposing native data or writing',
+    async code => {
+      await issued();
+      planPatch = v => ({
+        ...v,
+        ready: false,
+        failure: {
+          stage: 'dashboard_inventory',
+          code,
+          message: receipt.receipt,
+          native_error: { code: 'private-native-error', credential: receipt.receipt },
+          items: [
+            {
+              slug: base.items[0].slug,
+              success: false,
+              stage: 'dashboard_inventory',
+              code,
+              secret: receipt.receipt,
+            },
+          ],
+        },
+      });
+      const result = await call();
+      expect(body(result).error).toMatchObject({
+        message: 'MAINTENANCE_PREFLIGHT_FAILED',
+        data: {
+          failure: {
+            stage: 'dashboard_inventory',
+            code,
+            items: [
+              { slug: base.items[0].slug, success: false, stage: 'dashboard_inventory', code },
+            ],
+          },
+          execution_attempted: false,
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain(receipt.receipt);
+      expect(JSON.stringify(result)).not.toContain('private-native-error');
+      expect(writes()).toHaveLength(0);
+    }
+  );
+  it.each([
     ['ETIMEDOUT', 'provider_request_timeout'],
     ['ENOTFOUND', 'provider_dns_failed'],
     ['ECONNREFUSED', 'provider_connection_failed'],

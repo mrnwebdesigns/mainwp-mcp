@@ -316,3 +316,7 @@ npx tsx scripts/mrn-maintenance-regression-probe.ts \
 
 This uses no allowlist override and starts no child-site operation. It checks the
 unchanged tool schemas, Dashboard identity and local backup/major/core refusals.
+
+## Native preview refusals
+
+Dashboard 0.13.14 can distinguish `update_not_offered`, native site/global/type holds, version drift, permission denial, native input/output errors, and malformed/foreign/broad plans. The MCP preserves only fixed codes and exactly requested slugs; native messages and extra data remain excluded. Every refusal has `execution_attempted:false`. A missing offer requires a fresh installed-version and update-inventory read, not a stock-tool or ZIP fallback. A successful preview does not establish successful apply/readback. Existing backup, exact-site, confirmation, expiration, core refusal and per-plugin major-override gates remain in force.
