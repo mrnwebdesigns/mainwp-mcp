@@ -446,6 +446,130 @@ export async function executeEmailAudit(
   const index = (EMAIL_AUDIT_TOOLS as readonly string[]).indexOf(name);
   if (index < 0 || !config.allowedTools?.includes(name) || decidePolicy(config, name) !== 'allow')
     throw McpErrorFactory.permissionDenied('Email audit tool is not allowed');
+  validateEmailAuditInput(name, args);
+  if (
+    config.dashboardUrl.replace(/\/$/, '') !== 'https://wpcontrol.mrndev.io' ||
+    config.skipSslVerify ||
+    !config.abilityNamespaces.includes('mainwp') ||
+    !config.abilityNamespaces.includes('mrn-mainwp')
+  )
+    refuse('EMAIL_AUDIT_DASHBOARD_IDENTITY');
+  const deadlineAt = Date.now() + (index === 1 ? Number(args.max_duration_ms ?? 20000) : 30000);
+  const catalog = await fetchAbilities(config, false, logger);
+  for (const provider of [INSPECT, AUTHORIZE]) {
+    const a = catalog.find(a => a.name === provider);
+    if (
+      !a ||
+      a.meta?.annotations?.readonly !== true ||
+      a.meta?.annotations?.destructive === true ||
+      (a.meta as ObjectValue).mrn_email_audit_contract !== EMAIL_AUDIT_CONTRACT
+    )
+      refuse('EMAIL_AUDIT_PROVIDER_UNAVAILABLE');
+  }
+  const call = async (
+    abilityName: string,
+    input: ObjectValue,
+    internal = false,
+    timeout = 30_000,
+    perCallLimit = timeout
+  ): Promise<unknown> => {
+    const tool = abilityName.startsWith(PREFIX)
+      ? 'mrn_mainwp__' + abilityName.slice(PREFIX.length).replaceAll('-', '_')
+      : abilityName.slice('mainwp/'.length).replaceAll('-', '_');
+    if (
+      config.blockedTools?.includes(tool) ||
+      (!internal && decidePolicy(config, tool) !== 'allow')
+    )
+      throw McpErrorFactory.permissionDenied('Email audit supporting tool is not allowed');
+    const ability = catalog.find(a => a.name === abilityName);
+    if (!ability) refuse('EMAIL_AUDIT_SUPPORTING_ABILITY_MISSING');
+    if (
+      ability?.meta?.annotations?.destructive !== false ||
+      (abilityName !== 'mainwp/sync-sites-v1' && ability?.meta?.annotations?.readonly !== true)
+    )
+      refuse('EMAIL_AUDIT_SUPPORTING_ABILITY_UNQUALIFIED');
+    if (signal?.aborted) throw McpErrorFactory.cancelled();
+    const remaining = deadlineAt - Date.now();
+    if (remaining < 1000) refuse('EMAIL_AUDIT_BATCH_BUDGET');
+    const requestLimit = Math.min(config.requestTimeout, perCallLimit);
+    const requestTimeout = Math.min(requestLimit, timeout, remaining);
+    // This read-only workflow never needs longer timeouts or automatic HTTP retries.
+    try {
+      return await executeAbility(
+        { ...config, retryEnabled: false, requestTimeout },
+        abilityName,
+        input,
+        logger,
+        ability as Ability,
+        signal
+      );
+    } catch (error) {
+      // Only worker calls may defer after a shortened local deadline. Scope and
+      // authorization checks remain fail-closed; a full request timeout, early
+      // transport error or upstream refusal remains a genuine failure.
+      const workerCall = [
+        INSPECT,
+        'mainwp/get-site-knowledge-v1',
+        'mainwp/get-site-v1',
+        'mainwp/sync-sites-v1',
+      ].includes(abilityName);
+      if (
+        index === 1 &&
+        workerCall &&
+        requestTimeout < requestLimit &&
+        Date.now() >= deadlineAt &&
+        !signal?.aborted &&
+        error !== null &&
+        typeof error === 'object' &&
+        'code' in error &&
+        error.code === 'ETIMEDOUT' &&
+        ![401, 403].includes(getHttpStatus(error) ?? 0)
+      )
+        refuse('EMAIL_AUDIT_BATCH_BUDGET');
+      throw error;
+    }
+  };
+  return executeEmailAuditWithTransport(
+    { identity: configIdentityHash(config), call, deadlineAt },
+    name,
+    args,
+    signal,
+    store
+  );
+}
+
+/** Shared orchestration. Hosts supply an authenticated transport and private owner-bound store.
+ * No credentials, policy bypass, or virtual-tool-to-native-ability mapping is accepted here.
+ */
+export type EmailAuditStorage = Pick<EmailAuditStore, 'lock' | 'load' | 'save' | 'write'>;
+export type EmailAuditTransport = {
+  identity: string;
+  deadlineAt?: number;
+  call: (
+    ability: string,
+    input: ObjectValue,
+    internal: boolean,
+    timeout: number,
+    // Independent per-call cap before the continuation budget clips timeout.
+    // Adapters must independently prove their own local cancellation.
+    perCallLimit: number,
+    // Absolute engine deadline; a hosted challenge must share this budget.
+    deadlineAt: number
+  ) => Promise<unknown>;
+  fatal?: (error: unknown) => boolean;
+};
+export const EMAIL_AUDIT_ENGINE_CONTRACT = 'mrn-email-audit-engine-v1';
+const supportingAbilities = new Set([
+  INSPECT,
+  AUTHORIZE,
+  'mainwp/list-sites-v1',
+  'mainwp/get-site-v1',
+  'mainwp/get-site-knowledge-v1',
+  'mainwp/sync-sites-v1',
+]);
+function validateEmailAuditInput(name: string, args: ObjectValue): number {
+  const index = (EMAIL_AUDIT_TOOLS as readonly string[]).indexOf(name);
+  if (index < 0) refuse('EMAIL_AUDIT_INPUT');
   validateInput(args, schemas[index]);
   const properties = schemas[index].properties ?? {};
   if (
@@ -496,86 +620,35 @@ export async function executeEmailAudit(
   )
     refuse('EMAIL_AUDIT_REFRESH_SCOPE');
   if (index === 3 && !['json', 'csv'].includes(String(args.format))) refuse('EMAIL_AUDIT_FORMAT');
-  if (
-    config.dashboardUrl.replace(/\/$/, '') !== 'https://wpcontrol.mrndev.io' ||
-    config.skipSslVerify ||
-    !config.abilityNamespaces.includes('mainwp') ||
-    !config.abilityNamespaces.includes('mrn-mainwp')
-  )
-    refuse('EMAIL_AUDIT_DASHBOARD_IDENTITY');
-  const deadline = Date.now() + (index === 1 ? Number(args.max_duration_ms ?? 20000) : 30000);
-  const catalog = await fetchAbilities(config, false, logger);
-  for (const provider of [INSPECT, AUTHORIZE]) {
-    const a = catalog.find(a => a.name === provider);
-    if (
-      !a ||
-      a.meta?.annotations?.readonly !== true ||
-      a.meta?.annotations?.destructive === true ||
-      (a.meta as ObjectValue).mrn_email_audit_contract !== EMAIL_AUDIT_CONTRACT
-    )
-      refuse('EMAIL_AUDIT_PROVIDER_UNAVAILABLE');
-  }
-  const call = async (
-    abilityName: string,
-    input: ObjectValue,
-    internal = false,
-    timeout = 30_000
-  ): Promise<unknown> => {
-    const tool = abilityName.startsWith(PREFIX)
-      ? 'mrn_mainwp__' + abilityName.slice(PREFIX.length).replaceAll('-', '_')
-      : abilityName.slice('mainwp/'.length).replaceAll('-', '_');
-    if (
-      config.blockedTools?.includes(tool) ||
-      (!internal && decidePolicy(config, tool) !== 'allow')
-    )
-      throw McpErrorFactory.permissionDenied('Email audit supporting tool is not allowed');
-    const ability = catalog.find(a => a.name === abilityName);
-    if (!ability) refuse('EMAIL_AUDIT_SUPPORTING_ABILITY_MISSING');
-    if (
-      ability?.meta?.annotations?.destructive !== false ||
-      (abilityName !== 'mainwp/sync-sites-v1' && ability?.meta?.annotations?.readonly !== true)
-    )
-      refuse('EMAIL_AUDIT_SUPPORTING_ABILITY_UNQUALIFIED');
+  return index;
+}
+export async function executeEmailAuditWithTransport(
+  transport: EmailAuditTransport,
+  name: string,
+  args: ObjectValue,
+  signal: AbortSignal | undefined,
+  store: EmailAuditStorage
+): Promise<ObjectValue> {
+  const index = validateEmailAuditInput(name, args);
+  if (!/^(?:[a-f0-9]{16}|[a-f0-9]{64})$/.test(transport.identity))
+    refuse('EMAIL_AUDIT_IDENTITY_CHANGED');
+  const deadline = Math.min(
+    transport.deadlineAt ?? Infinity,
+    Date.now() + (index === 1 ? Number(args.max_duration_ms ?? 20000) : 30000)
+  );
+  const call = async (ability: string, input: ObjectValue, internal = false, timeout = 30000) => {
+    if (!supportingAbilities.has(ability)) refuse('EMAIL_AUDIT_SUPPORTING_ABILITY_MISSING');
     if (signal?.aborted) throw McpErrorFactory.cancelled();
     const remaining = deadline - Date.now();
     if (remaining < 1000) refuse('EMAIL_AUDIT_BATCH_BUDGET');
-    const requestLimit = Math.min(config.requestTimeout, timeout);
-    const requestTimeout = Math.min(requestLimit, remaining);
-    // This read-only workflow never needs longer timeouts or automatic HTTP retries.
-    try {
-      return await executeAbility(
-        { ...config, retryEnabled: false, requestTimeout },
-        abilityName,
-        input,
-        logger,
-        ability as Ability,
-        signal
-      );
-    } catch (error) {
-      // Only worker calls may defer after a shortened local deadline. Scope and
-      // authorization checks remain fail-closed; a full request timeout, early
-      // transport error or upstream refusal remains a genuine failure.
-      const workerCall = [
-        INSPECT,
-        'mainwp/get-site-knowledge-v1',
-        'mainwp/get-site-v1',
-        'mainwp/sync-sites-v1',
-      ].includes(abilityName);
-      if (
-        index === 1 &&
-        workerCall &&
-        requestTimeout < requestLimit &&
-        Date.now() >= deadline &&
-        !signal?.aborted &&
-        error !== null &&
-        typeof error === 'object' &&
-        'code' in error &&
-        error.code === 'ETIMEDOUT' &&
-        ![401, 403].includes(getHttpStatus(error) ?? 0)
-      )
-        refuse('EMAIL_AUDIT_BATCH_BUDGET');
-      throw error;
-    }
+    return transport.call(
+      ability,
+      input,
+      internal,
+      Math.min(timeout, remaining),
+      timeout,
+      deadline
+    );
   };
   const inventory = async (): Promise<Site[]> => {
     const sites: Site[] = [];
@@ -666,7 +739,7 @@ export async function executeEmailAudit(
     const job: EmailAuditJob = {
       schema: 1,
       audit_id: id,
-      identity: configIdentityHash(config),
+      identity: transport.identity,
       actor_id: actor,
       dashboard_host: 'wpcontrol.mrndev.io',
       address: args.address.toLowerCase(),
@@ -698,7 +771,7 @@ export async function executeEmailAudit(
   const unlock = store.lock(id);
   try {
     const job = store.load(id);
-    if (job.identity !== configIdentityHash(config) || job.dashboard_host !== 'wpcontrol.mrndev.io')
+    if (job.identity !== transport.identity || job.dashboard_host !== 'wpcontrol.mrndev.io')
       throw McpErrorFactory.permissionDenied('EMAIL_AUDIT_IDENTITY_CHANGED');
     const current = await inventory();
     for (const row of job.rows)
@@ -757,6 +830,7 @@ export async function executeEmailAudit(
                 await call('mainwp/get-site-knowledge-v1', { site_id: row.site_id });
                 row.limitations = row.limitations.filter(v => v !== 'site_knowledge_unavailable');
               } catch (error) {
+                if (transport.fatal?.(error)) throw error;
                 if (budgetError(error)) throw error;
                 row.limitations.push('site_knowledge_unavailable');
               }
@@ -778,6 +852,7 @@ export async function executeEmailAudit(
                 row.sync = 'returned';
                 preparation.sync_outcome = 'returned';
               } catch (error) {
+                if (transport.fatal?.(error)) throw error;
                 row.sync = 'timeout_or_refused';
                 preparation.sync_outcome = 'timeout_or_refused';
                 row.limitations.push('inventory_sync_unverified');
@@ -794,6 +869,7 @@ export async function executeEmailAudit(
                   include_stats: false,
                 });
               } catch (error) {
+                if (transport.fatal?.(error)) throw error;
                 if (budgetError(error)) throw error;
                 row.limitations.push('inventory_readback_failed');
               }
@@ -886,6 +962,7 @@ export async function executeEmailAudit(
               if (v.done) break;
             }
           } catch (error) {
+            if (transport.fatal?.(error)) throw error;
             if (
               signal?.aborted ||
               (error instanceof Error && error.message.includes('EMAIL_AUDIT_BATCH_BUDGET'))

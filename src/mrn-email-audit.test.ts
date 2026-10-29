@@ -1,5 +1,6 @@
 /** Synthetic Dashboard/child fixtures only; never contacts or mutates client sites. */
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -692,21 +693,23 @@ describe('native read-only email configuration audit', () => {
     expect(v.unmatched).toBe(0);
   });
   it('exports only minimal evidence, protects files and writes formula-safe CSV with coverage sidecar', async () => {
+    // Generated synthetic exclusion value; no stored credential fixture.
+    const excludedValue = `synthetic-excluded-${randomUUID()}`;
     child = async input => ({
       ...page(input, [
         match(1, {
           form_title: '=1+2',
-          password: 'sensitive-secret',
-          full_option: 'sensitive-secret',
+          password: excludedValue,
+          full_option: excludedValue,
         }),
       ]),
-      password: 'sensitive-secret',
+      password: excludedValue,
     });
     const s = await start({ scope: 'site', site_urls: ['https://site1.example'] });
     await run(1, { audit_id: s.audit_id });
     const v = await run(3, { audit_id: s.audit_id, format: 'json' });
     const data = fs.readFileSync(String(v.file), 'utf8');
-    expect(data).not.toContain('sensitive-secret');
+    expect(data).not.toContain(excludedValue);
     expect(data).not.toContain('identity');
     expect(fs.statSync(String(v.file)).mode & 0o777).toBe(0o600);
     const csv = await run(3, { audit_id: s.audit_id, format: 'csv' });

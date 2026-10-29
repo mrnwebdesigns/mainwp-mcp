@@ -260,3 +260,40 @@ inheritance/encoding, disabled/inactive/draft states, object/secret exclusion,
 site/actor/ACL changes, timeouts, bounded concurrency, resume, partial 106-site
 inventory and fresh MCP protocol discovery. Fixture success is not a deployed
 child-site verification. See `EMAIL-ADDRESS-AUDIT-DEPLOYMENT.md` for release gates.
+
+## Hosted Google gateway engine adapter (source candidate)
+
+`executeEmailAuditWithTransport` reuses this module's existing bounded inventory,
+preparation checkpoints, scan, coverage, result and export logic. Its caller must
+supply an authenticated native-ability transport and private owner-bound storage.
+It has no credential input or virtual-tool-to-WordPress-ability mapping. The
+closed engine contract is `mrn-email-audit-engine-v1`. A fatal authorization
+failure stops the reader rather than becoming an ordinary per-site coverage gap.
+The hosted gateway uses serial readers and rechecks current access before releasing
+results. Existing local `executeEmailAudit` keeps its native policy/catalog checks,
+credential identity hash, numeric WordPress actor, deadlines and filesystem store.
+
+This entry point is source integration only. It does not change the configured
+Codex/Claude runtime, native permissions, safe mode, or any child reader. Hosted
+Google authorization, per-person custody and resource delivery must be qualified
+by the gateway composition, including negative identity and stale-scope tests.
+
+### Native budget-fix composition
+
+This candidate composes accepted native fix `d486395ec53f4820bc9b9836f44c0c78fdc64292`
+(merged as `cece5a519c3125b36e8bb1c82b2a1ab46c883738`). The injected call receives
+its original per-call cap as a fifth argument and absolute engine deadline as
+a sixth argument, separately from the already clipped timeout. The native adapter alone compares that cap with its configured
+request limit and recognizes its structured `ETIMEDOUT` at the continuation
+deadline. Inventory and authorization stay outside worker deferral. All seven
+accepted regressions are retained unchanged; limits and retries do not change.
+
+The generic injected engine does not interpret SDK `-32001`, an injected
+`ETIMEDOUT`, gateway `OpsError`, or message text as native timeout proof. The
+hosted gateway separately verifies that such errors remain failed/fatal, preserve
+previous pages, and cannot trigger automatic retry or release revoked evidence.
+The gateway adapter separately qualifies its private request timer and exact
+abort-reason object through the real SDK. It must span the delegation challenge
+and read, await cancellation settlement, preserve fatal access errors and reject
+late success. This engine passes budget metadata; it does not authenticate a
+caller-provided timeout code or claim hosted deployment/ChatGPT acceptance.
